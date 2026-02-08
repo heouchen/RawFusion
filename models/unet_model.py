@@ -128,3 +128,12 @@ class UNetUpBlock(nn.Module):
         out = self.conv_block(out)
 
         return out
+
+if __name__ == "__main__":
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    modelviz = UNet().to(device)
+    # 4. get_model_complexity_info 打印运算浮点数和参数量
+    from ptflops import get_model_complexity_info
+    macs, params = get_model_complexity_info(modelviz, (9, 512, 512), verbose=True, print_per_layer_stat=True)
+    print(macs, params)
