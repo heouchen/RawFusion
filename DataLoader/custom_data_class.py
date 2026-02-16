@@ -2,27 +2,34 @@ import torch
 import torchvision.transforms as transforms
 import os
 import cv2
+import numpy as np
 from tqdm import tqdm
-from typing import Optional
+from typing import Optional, List, Tuple
 
 
 class HDRBurstAugment:
     """
-    Burst HDR/ISP 任务的数据增广（按样本随机、可配置开关）。
-
-    重要说明（RAW Bayer 安全性）：
-    - 输入是单通道 Bayer mosaic（通过 squeeze(2) 变成 9 通道喂给网络）。
-    - 对 Bayer mosaic 做翻转/旋转/奇数像素平移会改变 CFA 相位（GRBG->RGGB/BGGR/...），与真实测试分布不一致。
-    - 因此默认仅提供“Bayer-safe”的增广：偶数偏移裁剪 + （可选）加噪。
-    - 如果你明确希望做翻转/旋转，请在模型侧做 pack/unpack 或显式处理 CFA 相位后再打开。
+    Burst HDR/ISP 任务的数据增广。
+    现在数据已 Packing 为 (H/2, W/2, 4)，不再受 Bayer 相位限制。
     """
 
     def __init__(
         self,
         enable: bool = False,
         crop_enable: bool = True,
-        crop_size: int = 512,
-        crop_even_offset: bool = True,
+        crop_size: int = 256,  # 减半 (512 -> 256)
+        crop_sizes: Optional[List[Tuple[int, int]]] = None,
+        crop_even_offset: bool = False, # Packing 后不再强制偶数
+        geo_enable: bool = False,
+        geo_flip_enable: bool = True,
+        geo_rot90_enable: bool = True,
+        exp_enable: bool = False,
+        exp_range_low: Tuple[float, float] = (0.9, 1.1),
+        exp_range_mid: Tuple[float, float] = (0.9, 1.1),
+        exp_range_high: Tuple[float, float] = (0.9, 1.1),
+        exp_global: bool = False,
+        wb_enable: bool = False,
+        wb_gain_delta: float = 0.05,
         noise_enable: bool = False,
         noise_std: float = 0.0,
         clamp: bool = True,
@@ -30,56 +37,172 @@ class HDRBurstAugment:
         self.enable = bool(enable)
         self.crop_enable = bool(crop_enable)
         self.crop_size = int(crop_size)
+        self.crop_sizes = crop_sizes
         self.crop_even_offset = bool(crop_even_offset)
+        self.geo_enable = bool(geo_enable)
+        self.geo_flip_enable = bool(geo_flip_enable)
+        self.geo_rot90_enable = bool(geo_rot90_enable)
+        self.exp_enable = bool(exp_enable)
+        self.exp_range_low = exp_range_low
+        self.exp_range_mid = exp_range_mid
+        self.exp_range_high = exp_range_high
+        self.exp_global = bool(exp_global)
+        self.wb_enable = bool(wb_enable)
+        self.wb_gain_delta = float(wb_gain_delta)
         self.noise_enable = bool(noise_enable)
         self.noise_std = float(noise_std)
         self.clamp = bool(clamp)
 
-    def _random_crop(self, inputs: torch.Tensor, target: torch.Tensor):
-        # inputs: (9, C, H, W)  target: (C, H, W)
+    def _pick_crop_size(self):
+        if not self.crop_sizes:
+            return self.crop_size, self.crop_size
+        idx = int(torch.randint(0, len(self.crop_sizes), (1,)).item())
+        h, w = self.crop_sizes[idx]
+        return int(h), int(w)
+
+    def _random_crop_with_size(
+        self, inputs: torch.Tensor, target: torch.Tensor, ch: int, cw: int
+    ):
+        # inputs: (9, 4, H, W)  target: (3, H*2, W*2)
         _, _, h, w = inputs.shape
-        ps = self.crop_size
-        if ps <= 0 or ps > h or ps > w:
+        if ch <= 0 or cw <= 0 or ch > h or cw > w:
             return inputs, target
 
-        max_y = h - ps
-        max_x = w - ps
+        max_y = h - ch
+        max_x = w - cw
         if max_y == 0 and max_x == 0:
             return inputs, target
 
-        if self.crop_even_offset:
-            # Bayer-safe：保持 (x,y) parity，不改变 CFA 相位
-            y = int(torch.randint(0, max_y + 1, (1,)).item())
-            x = int(torch.randint(0, max_x + 1, (1,)).item())
-            y = (y // 2) * 2
-            x = (x // 2) * 2
-            y = min(y, max_y)
-            x = min(x, max_x)
-        else:
-            y = int(torch.randint(0, max_y + 1, (1,)).item())
-            x = int(torch.randint(0, max_x + 1, (1,)).item())
+        y = int(torch.randint(0, max_y + 1, (1,)).item())
+        x = int(torch.randint(0, max_x + 1, (1,)).item())
 
-        inputs = inputs[:, :, y : y + ps, x : x + ps]
-        target = target[:, y : y + ps, x : x + ps]
+        inputs = inputs[:, :, y : y + ch, x : x + cw]
+        # 注意：target 是全分辨率，需要对应裁剪
+        target = target[:, y * 2 : (y + ch) * 2, x * 2 : (x + cw) * 2]
         return inputs, target
 
-    def _add_noise(self, inputs: torch.Tensor):
-        if self.noise_std <= 0:
+    def _random_crop(self, inputs: torch.Tensor, target: torch.Tensor):
+        ch, cw = self._pick_crop_size()
+        return self._random_crop_with_size(inputs, target, ch, cw)
+
+    def _sample_geom(self):
+        hflip = self.geo_flip_enable and bool(torch.randint(0, 2, (1,)).item())
+        vflip = self.geo_flip_enable and bool(torch.randint(0, 2, (1,)).item())
+        if self.geo_rot90_enable:
+            rot_k = int(torch.randint(0, 4, (1,)).item())
+        else:
+            rot_k = 0
+        return hflip, vflip, rot_k
+
+    def _apply_geom(self, inputs: torch.Tensor, target: torch.Tensor, geom):
+        hflip, vflip, rot_k = geom
+        if hflip:
+            inputs = torch.flip(inputs, dims=[-1])
+            target = torch.flip(target, dims=[-1])
+        if vflip:
+            inputs = torch.flip(inputs, dims=[-2])
+            target = torch.flip(target, dims=[-2])
+        if rot_k:
+            inputs = torch.rot90(inputs, k=rot_k, dims=[-2, -1])
+            target = torch.rot90(target, k=rot_k, dims=[-2, -1])
+        return inputs, target
+
+    def _apply_exposure_jitter(self, inputs: torch.Tensor):
+        # inputs: (9, 4, H, W)
+        
+        if self.exp_global:
+            # 全局增益：所有帧乘同一个系数 (模拟场景亮度变化)
+            # 使用 mid range 作为全局范围
+            lo, hi = self.exp_range_mid
+            g = (hi - lo) * torch.rand(1).item() + lo
+            # g: scalar
+            return inputs * g
+        else:
+            # 独立增益：每帧独立随机 (破坏 Burst 物理一致性，仅作强扰动)
+            ranges = [
+                self.exp_range_low, self.exp_range_low, self.exp_range_low,
+                self.exp_range_mid, self.exp_range_mid, self.exp_range_mid,
+                self.exp_range_high, self.exp_range_high, self.exp_range_high,
+            ]
+            gains = []
+            for lo, hi in ranges:
+                g = (hi - lo) * torch.rand(1).item() + lo
+                gains.append(g)
+            gains = torch.tensor(gains, dtype=inputs.dtype, device=inputs.device).view(9, 1, 1, 1)
+            return inputs * gains
+
+    def _apply_wb_jitter(self, inputs: torch.Tensor):
+        # inputs: (9, 4, H, W)
+        # 仅对 R (index 1) 和 B (index 2) 通道进行白平衡增强（假设 GRBG Packing）
+        delta = self.wb_gain_delta
+        if delta <= 0:
             return inputs
-        # 简单高斯读噪（对 RAW 更贴近真实；GT 不加噪）
-        noise = torch.randn_like(inputs) * self.noise_std
-        return inputs + noise
+        
+        # 初始化全 1 增益
+        gains = torch.ones((9, 4, 1, 1), dtype=inputs.dtype, device=inputs.device)
+        
+        # 为 R 和 B 通道生成随机增益 [1-delta, 1+delta]
+        rb_gains = (1.0 - delta) + (2.0 * delta) * torch.rand((9, 2, 1, 1), dtype=inputs.dtype, device=inputs.device)
+        
+        # 赋值到 index 1 (R) 和 index 2 (B)
+        gains[:, 1:3, :, :] = rb_gains
+        
+        return inputs * gains
 
     def __call__(self, inputs: torch.Tensor, target: torch.Tensor):
         if not self.enable:
             return inputs, target
 
-        # 注意：self.cache 里的 Tensor 会在多进程间共享；这里绝不能原地修改缓存
         if self.crop_enable:
             inputs, target = self._random_crop(inputs, target)
 
+        if self.geo_enable:
+            geom = self._sample_geom()
+            inputs, target = self._apply_geom(inputs, target, geom)
+
+        if self.exp_enable:
+            inputs = self._apply_exposure_jitter(inputs)
+
+        if self.wb_enable:
+            inputs = self._apply_wb_jitter(inputs)
+
         if self.noise_enable:
-            inputs = self._add_noise(inputs)
+            noise = torch.randn_like(inputs) * self.noise_std
+            inputs = inputs + noise
+
+        if self.clamp:
+            inputs = inputs.clamp(0.0, 1.0)
+            target = target.clamp(0.0, 1.0)
+        return inputs.contiguous(), target.contiguous()
+
+    def augment_with_crop_size(
+        self,
+        inputs: torch.Tensor,
+        target: torch.Tensor,
+        crop_size: Tuple[int, int],
+        geom=None,
+    ):
+        if not self.enable:
+            return inputs, target
+
+        ch, cw = crop_size
+        if self.crop_enable:
+            inputs, target = self._random_crop_with_size(inputs, target, ch, cw)
+
+        if self.geo_enable:
+            if geom is None:
+                geom = self._sample_geom()
+            inputs, target = self._apply_geom(inputs, target, geom)
+
+        if self.exp_enable:
+            inputs = self._apply_exposure_jitter(inputs)
+
+        if self.wb_enable:
+            inputs = self._apply_wb_jitter(inputs)
+
+        if self.noise_enable:
+            noise = torch.randn_like(inputs) * self.noise_std
+            inputs = inputs + noise
 
         if self.clamp:
             inputs = inputs.clamp(0.0, 1.0)
@@ -88,12 +211,6 @@ class HDRBurstAugment:
 
 
 class CustomDataset(torch.utils.data.Dataset):
-    """
-    预加载全部图像到内存，供 DataLoader 多 worker 共享访问。
-    - Linux: 主进程 __init__ 中加载后，fork 出的 worker 通过 copy-on-write 共享同一份内存，只读访问不复制。
-    - 所有图像保存在 self.cache 中，__getitem__ 仅做索引返回，无磁盘 IO。
-    """
-
     def __init__(
         self,
         root_dir,
@@ -107,7 +224,6 @@ class CustomDataset(torch.utils.data.Dataset):
         self.train = train
         self.augment = augment
 
-        # 扫描实际存在的场景编号
         all_files = os.listdir(self.root_dir)
         self.scene_ids = sorted(
             int(f.split("-")[1]) for f in all_files if f.endswith("-gt.tif")
@@ -115,9 +231,8 @@ class CustomDataset(torch.utils.data.Dataset):
         n_scenes = len(self.scene_ids)
         print(f"Found {n_scenes} scenes in {self.root_dir}")
 
-        # 预加载所有图像到内存（主进程执行，worker fork 后共享此内存）
         self.cache = []
-        for idx in tqdm(range(n_scenes), desc="Loading dataset into memory", ncols=80):
+        for idx in tqdm(range(n_scenes), desc="Loading dataset and packing Bayer", ncols=80):
             scene_id = self.scene_ids[idx]
             input_tensors = []
             for i in range(9):
@@ -125,17 +240,31 @@ class CustomDataset(torch.utils.data.Dataset):
                 arr = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
                 if arr is None:
                     raise FileNotFoundError(f"Cannot read: {img_path}")
-                input_tensors.append(
-                    self.transform(arr) if self.transform else torch.from_numpy(arr)
-                )
+                
+                # 处理伪三通道
+                if len(arr.shape) == 3:
+                    arr = arr[:, :, 0]
+                
+                # Bayer Packing (GRBG pattern)
+                # G1 R
+                # B G2
+                g1 = arr[0::2, 0::2]
+                r  = arr[0::2, 1::2]
+                b  = arr[1::2, 0::2]
+                g2 = arr[1::2, 1::2]
+                
+                packed = np.stack([r, g1, g2, b], axis=0) # (4, 384, 768)
+                input_tensors.append((torch.from_numpy(packed).float() / 65535.0)**(1/2.2) if arr.dtype == np.uint16 else (torch.from_numpy(packed).float())**(1/2.2))
+
             gt_path = f"{self.root_dir}Scene-{scene_id:03d}-gt.tif"
             gt_arr = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED)
             if gt_arr is None:
                 raise FileNotFoundError(f"Cannot read: {gt_path}")
-            gt_tensor = (
-                self.transform(gt_arr) if self.transform else torch.from_numpy(gt_arr)
-            )
-            inputs = torch.stack(input_tensors)  # (9, C, H, W)
+            
+            # GT (768, 1536, 3) -> (3, 768, 1536)
+            gt_tensor = self.transform(gt_arr) if self.transform else torch.from_numpy(gt_arr).permute(2,0,1).float()
+            
+            inputs = torch.stack(input_tensors)  # (9, 4, 384, 768)
             self.cache.append((inputs, gt_tensor))
 
         print(f"Cached {len(self.cache)} scenes in memory.")
@@ -144,11 +273,6 @@ class CustomDataset(torch.utils.data.Dataset):
         return len(self.cache)
 
     def __getitem__(self, idx):
-        """
-        Returns:
-            inputs (Tensor): (9, C, H, W)
-            target (Tensor): (C, H, W)
-        """
         inputs, target = self.cache[idx]
         if self.train and (self.augment is not None):
             inputs, target = self.augment(inputs, target)

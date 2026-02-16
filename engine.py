@@ -1,0 +1,92 @@
+import torch
+import torch.nn as nn
+import time
+
+from tqdm import tqdm
+from PIL import Image
+from torchvision.transforms import transforms
+
+from utils.utils import calculate_psnr, calculate_ssim
+from utils.loss import safnet_loss, CharbonnierLoss
+to_pil_image = transforms.ToPILImage()
+charbonnier_loss = CharbonnierLoss()
+
+def train_one_epoch(model, data_loader, optimizer, scaler, use_amp, cuda,
+                    epoch, n_epoch, output_dir):
+    """单 epoch 训练，返回 (avg_loss, step_count)"""
+    model.train()
+    MSE_loss = nn.MSELoss()
+    lr_current = optimizer.param_groups[0]['lr']
+
+    # 训练循环（使用 tqdm 显示进度）
+    pbar = tqdm(data_loader, desc=f'Epoch {epoch}/{n_epoch} [LR={lr_current:.6f}]', ncols=100)
+    epoch_loss = 0.0
+    step_count = 0
+
+    for step, (burst_noise, gt) in enumerate(pbar):
+        if cuda:
+            burst_noise = burst_noise.cuda(non_blocking=True)
+            gt = gt.cuda(non_blocking=True)
+
+        # burst_noise: (B, 9, 4, H, W) -> (B, 36, H, W)
+        b, f, c, h, w = burst_noise.shape
+        burst_noise = burst_noise.view(b, f * c, h, w)
+
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            pred = model(burst_noise)
+            loss = charbonnier_loss(pred, gt)
+            #loss = safnet_loss(pred, gt)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        loss_val = loss.item()
+        epoch_loss += loss_val
+
+        # 更新 tqdm 显示的损失
+        pbar.set_postfix({'loss': f'{loss_val:.4f}'})
+
+        # 保存样例图片（仅在特定 epoch）
+        if (epoch % 50 == 0) and (step < 5):
+            with torch.no_grad():
+                pil_image = to_pil_image(gt[0].cpu())
+                pil_image.save(f'./{output_dir}/E{epoch}_Batch{step}_gt.png')
+                pil_image = to_pil_image(pred[0].cpu().clamp(0, 1))
+                pil_image.save(f'./{output_dir}/E{epoch}_Batch{step}_output.png')
+
+        step_count += 1
+
+    pbar.close()
+    avg_loss = epoch_loss / len(data_loader)
+    return avg_loss, step_count
+
+
+def validate(model, val_loader, use_amp, cuda):
+    """验证循环，返回 (psnr, ssim)"""
+    model.eval()
+    val_psnr_sum = 0.0
+    val_ssim_sum = 0.0
+    val_count = 0
+
+    with torch.no_grad():
+        val_pbar = tqdm(val_loader, desc='Validation', ncols=100, leave=False)
+        for burst_noise, gt in val_pbar:
+            if cuda:
+                burst_noise = burst_noise.cuda(non_blocking=True)
+                gt = gt.cuda(non_blocking=True)
+
+            # burst_noise: (B, 9, 4, H, W) -> (B, 36, H, W)
+            b, f, c, h, w = burst_noise.shape
+            burst_noise = burst_noise.view(b, f * c, h, w)
+
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                pred = model(burst_noise)
+            val_psnr_sum += calculate_psnr(pred.unsqueeze(1), gt.unsqueeze(1))
+            val_ssim_sum += calculate_ssim(pred.unsqueeze(1), gt.unsqueeze(1))
+            val_count += 1
+        val_pbar.close()
+
+    val_psnr = val_psnr_sum / val_count if val_count > 0 else 0.0
+    val_ssim = val_ssim_sum / val_count if val_count > 0 else 0.0
+    return val_psnr, val_ssim

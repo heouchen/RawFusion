@@ -1,35 +1,28 @@
 """
-We refer the code made from  
+We refer the code made from
 https://github.com/z-bingo/kernel-prediction-networks-PyTorch/blob/master/train_eval_syn.py
 """
-
-
 
 import torch
 import torch.optim as optim
 from torch.optim import lr_scheduler
 import torch.nn as nn
-from torch.utils.data import DataLoader
 
 import numpy as np
 import argparse
 
-import os, sys, time, shutil
+import os, time, shutil
 from datetime import datetime
-from tqdm import tqdm
 
-from PIL import Image
 from torchvision.transforms import transforms
-to_pil_image = transforms.ToPILImage()
 
-from DataLoader.custom_data_class import CustomDataset
-from DataLoader.custom_data_class import HDRBurstAugment
-from models.unet_model import UNet
-from models.ULite import ULite
-import pdb
+from DataLoader.custom_data_class import CustomDataset, HDRBurstAugment
+from DataLoader.collate import make_train_collate, parse_crop_sizes
+from models import build_model, MODEL_NAMES
+from utils.checkpoint import save_checkpoint
+from utils.utils import resume_or_load
+from engine import train_one_epoch, validate
 
-from utils.utils import *
-from utils.checkpoint import *
 
 def train(
     num_threads,
@@ -46,10 +39,25 @@ def train(
     lr_decay=0.95,
     aug_enable=False,
     aug_crop_enable=True,
-    aug_crop_size=512,
-    aug_crop_even_offset=True,
+    aug_crop_size=256,
+    aug_crop_sizes=None,
+    aug_crop_even_offset=False,
+    aug_geo_enable=False,
+    aug_geo_flip_enable=True,
+    aug_geo_rot90_enable=True,
+    aug_exp_enable=False,
+    aug_exp_low_min=0.9,
+    aug_exp_low_max=1.1,
+    aug_exp_mid_min=0.9,
+    aug_exp_mid_max=1.1,
+    aug_exp_high_min=0.9,
+    aug_exp_high_max=1.1,
+    aug_exp_global=False,
+    aug_wb_enable=False,
+    aug_wb_gain_delta=0.05,
     aug_noise_enable=False,
     aug_noise_std=0.0,
+    pretrained_path=None,
 ):
     torch.set_num_threads(num_threads)
 
@@ -57,7 +65,7 @@ def train(
     exp_name = (exp_name or "default").strip().replace(" ", "_")
 
     # checkpoint path（不同模型使用不同目录）
-    checkpoint_dir = f'checkpoint_dir_{model_name}_{exp_name}'
+    checkpoint_dir = f'./checkpoint_dir/checkpoint_dir_{model_name}_{exp_name}'
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
     # output path
@@ -83,16 +91,30 @@ def train(
         enable=aug_enable,
         crop_enable=aug_crop_enable,
         crop_size=aug_crop_size,
+        crop_sizes=None,  # 多尺度时由 collate_fn 统一选择
         crop_even_offset=aug_crop_even_offset,
+        geo_enable=aug_geo_enable,
+        geo_flip_enable=aug_geo_flip_enable,
+        geo_rot90_enable=aug_geo_rot90_enable,
+        exp_enable=aug_exp_enable,
+        exp_range_low=(aug_exp_low_min, aug_exp_low_max),
+        exp_range_mid=(aug_exp_mid_min, aug_exp_mid_max),
+        exp_range_high=(aug_exp_high_min, aug_exp_high_max),
+        exp_global=aug_exp_global,
+        wb_enable=aug_wb_enable,
+        wb_gain_delta=aug_wb_gain_delta,
         noise_enable=aug_noise_enable,
         noise_std=aug_noise_std,
         clamp=True,
     )
+    use_batch_crop = bool(aug_enable and aug_crop_enable and aug_crop_sizes)
+    use_batch_geom = bool(aug_enable and aug_geo_enable and aug_geo_rot90_enable)
+    use_batch_collate = use_batch_crop or use_batch_geom
     train_set = CustomDataset(
         root_dir=train_root,
         transform=transforms.ToTensor(),
         train=True,
-        augment=train_aug,
+        augment=None if use_batch_collate else train_aug,
     )
     num_workers = 2
     data_loader = torch.utils.data.DataLoader(
@@ -102,6 +124,7 @@ def train(
         num_workers=num_workers,
         pin_memory=cuda,
         persistent_workers=(num_workers > 0),
+        collate_fn=make_train_collate(train_aug, aug_crop_sizes, batch_geom=use_batch_geom) if use_batch_collate else None,
     )
     print("Train loader length:", len(data_loader))
 
@@ -122,24 +145,10 @@ def train(
         persistent_workers=True,
     )
     print("Val loader length:", len(val_loader))
-    
+
     # 模型选择
-    if model_name.lower() == 'ulite':
-        model = ULite()
-        print('=> Using ULite model')
-    elif model_name.lower() == 'unet':
-        model = UNet(
-            in_channels=9,  # 9 frames considered as channel dimension
-            n_classes=3,    # out channels (RGB)
-            depth=4,
-            wf=6,
-            padding=True,
-            batch_norm=False,
-            up_mode='upconv'
-        )
-        print('=> Using UNet model')
-    else:
-        raise ValueError(f"Unknown model: {model_name}. Choose 'unet' or 'ulite'")
+    model = build_model(model_name)
+    print(f'=> Using {model_name} model')
 
     print('\n-------Training started -------\n')
 
@@ -156,113 +165,37 @@ def train(
     scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=lr_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-    average_loss = MovingAverage(200)
-    if not restart_train:
-        try:
-            checkpoint = load_checkpoint(checkpoint_dir, 'best')
-            start_epoch = checkpoint['epoch']
-            global_step = checkpoint['global_iter']
-            best_loss = checkpoint['best_loss']
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            if use_amp and 'scaler' in checkpoint:
-                scaler.load_state_dict(checkpoint['scaler'])
-            if 'log_path' in checkpoint:
-                log_txt_path = checkpoint['log_path']
-                log_header_written = True  # 续训时已有表头，只追加
-            print('=> loaded checkpoint (epoch {}, global_step {})'.format(start_epoch, global_step))
-        except:
-            start_epoch = 0
-            global_step = 0
-            best_loss = np.inf
-            print('=> no checkpoint file to be loaded.')
-    else:
-        start_epoch = 0
-        global_step = 0
-        best_loss = np.inf
-        if os.path.exists(checkpoint_dir):
-            pass
-        else:
-            os.mkdir(checkpoint_dir)
-        print('=> training')
-
-    MSE_loss = nn.MSELoss()
+    start_epoch, global_step, best_loss, log_txt_path, log_header_written = resume_or_load(
+        model, optimizer, scheduler, scaler, use_amp,
+        restart_train, checkpoint_dir, pretrained_path, log_txt_path
+    )
 
     print(f"=> Experiment: {exp_name}")
-    print(f"=> Augment: enable={aug_enable}, crop={aug_crop_enable}({aug_crop_size}, even={aug_crop_even_offset}), "
-          f"noise={aug_noise_enable}(std={aug_noise_std})")
+    crop_desc = aug_crop_sizes if aug_crop_sizes else aug_crop_size
+    print(
+        f"=> Augment: enable={aug_enable}, crop={aug_crop_enable}({crop_desc}, even={aug_crop_even_offset}), "
+        f"geo={aug_geo_enable}(flip={aug_geo_flip_enable}, rot90={aug_geo_rot90_enable}), "
+        f"exp={aug_exp_enable}(low={aug_exp_low_min}-{aug_exp_low_max}, "
+        f"mid={aug_exp_mid_min}-{aug_exp_mid_max}, high={aug_exp_high_min}-{aug_exp_high_max}, "
+        f"global={aug_exp_global}), "
+        f"wb={aug_wb_enable}(delta={aug_wb_gain_delta}), "
+        f"noise={aug_noise_enable}(std={aug_noise_std})"
+    )
 
     for epoch in range(start_epoch, n_epoch):
-        model.train()
         epoch_start_time = time.time()
         lr_current = optimizer.param_groups[0]['lr']
-        
-        # 训练循环（使用 tqdm 显示进度）
-        pbar = tqdm(data_loader, desc=f'Epoch {epoch}/{n_epoch} [LR={lr_current:.6f}]', ncols=100)
-        epoch_loss = 0.0
-        
-        for step, (burst_noise, gt) in enumerate(pbar):
-            if cuda:
-                burst_noise = burst_noise.cuda(non_blocking=True)
-                gt = gt.cuda(non_blocking=True)
-            burst_noise = burst_noise.squeeze(2)
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda', enabled=use_amp):
-                pred = model(burst_noise)
-                loss = MSE_loss(pred, gt)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            loss_val = loss.item()
-            average_loss.update(loss)
-            epoch_loss += loss_val
-            
-            # 更新 tqdm 显示的损失
-            pbar.set_postfix({'loss': f'{loss_val:.4f}'})
-
-            # 保存样例图片（仅在特定 epoch）
-            if (epoch % 50 == 0) and (step < 5):
-                with torch.no_grad():
-                    for frame in range(9):
-                        pil_image = to_pil_image(burst_noise[0][frame].cpu())
-                        pil_image.save(f'./{output_dir}/Batch{step}_input{frame}.png')
-                    pil_image = to_pil_image(gt[0].cpu())
-                    pil_image.save(f'./{output_dir}/Batch{step}_gt.png')
-                    pil_image = to_pil_image(pred[0].cpu())
-                    pil_image.save(f'./{output_dir}/Batch{step}_output_E{epoch}.png')
-            
-            global_step += 1
-        
-        pbar.close()
-        avg_train_loss = epoch_loss / len(data_loader)
+        avg_train_loss, step_count = train_one_epoch(
+            model, data_loader, optimizer, scaler, use_amp, cuda,
+            epoch, n_epoch, output_dir
+        )
+        global_step += step_count
         epoch_time = time.time() - epoch_start_time
 
         # 验证集评估
-        model.eval()
-        val_psnr_sum = 0.0
-        val_ssim_sum = 0.0
-        val_count = 0
-        
-        with torch.no_grad():
-            val_pbar = tqdm(val_loader, desc='Validation', ncols=100, leave=False)
-            for burst_noise, gt in val_pbar:
-                if cuda:
-                    burst_noise = burst_noise.cuda(non_blocking=True)
-                    gt = gt.cuda(non_blocking=True)
-                burst_noise = burst_noise.squeeze(2)
-                with torch.amp.autocast('cuda', enabled=use_amp):
-                    pred = model(burst_noise)
-                val_psnr_sum += calculate_psnr(pred.unsqueeze(1), gt.unsqueeze(1))
-                val_ssim_sum += calculate_ssim(pred.unsqueeze(1), gt.unsqueeze(1))
-                val_count += 1
-            val_pbar.close()
-        
-        val_psnr = val_psnr_sum / val_count if val_count > 0 else 0.0
-        val_ssim = val_ssim_sum / val_count if val_count > 0 else 0.0
-        
+        val_psnr, val_ssim = validate(model, val_loader, use_amp, cuda)
+
         # 打印 epoch 总结
         print(f'\n[Epoch {epoch:04d}] Time: {epoch_time:.1f}s | Train Loss: {avg_train_loss:.5f} | '
               f'Val PSNR: {val_psnr:.3f} dB | Val SSIM: {val_ssim:.4f}\n')
@@ -274,15 +207,16 @@ def train(
                 log_header_written = True
             f.write(f'{epoch}\t{avg_train_loss:.6f}\t{val_psnr:.6f}\t{val_ssim:.6f}\t{epoch_time:.2f}\t{lr_current:.8f}\n')
 
-        if epoch % 5 == 0:
-            if average_loss.get_value() < best_loss:
-                is_best = True
-                best_loss = average_loss.get_value()
-            else:
-                is_best = False
+        # 每个 epoch 都判断 is_best，确保不遗漏最优模型
+        if avg_train_loss < best_loss:
+            is_best = True
+            best_loss = avg_train_loss
+        else:
+            is_best = False
 
+        if epoch % 5 == 0 or is_best:
             save_dict = {
-                'epoch': epoch,
+                'epoch': epoch + 1,
                 'global_iter': global_step,
                 'state_dict': model.state_dict(),
                 'best_loss': best_loss,
@@ -298,18 +232,17 @@ def train(
 
 
         # decay the learning rate
-        lr_cur = [param['lr'] for param in optimizer.param_groups]
-        if lr_cur[0] > 5e-6:
-            scheduler.step()
-        else:
-            for param in optimizer.param_groups:
+        scheduler.step()
+        # 学习率下限保护
+        for param in optimizer.param_groups:
+            if param['lr'] < 5e-6:
                 param['lr'] = 5e-6
 
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='ulite', choices=['unet', 'ulite'])
+    parser.add_argument('--model', type=str, default='ulite', choices=MODEL_NAMES)
     parser.add_argument('--exp_name', type=str, default='default')
     parser.add_argument('--train_root', type=str, default="/home/chen/data/ntire2026/hdr/train/")
     parser.add_argument('--val_root', type=str, default="/home/chen/data/ntire2026/hdr/validation/")
@@ -321,12 +254,28 @@ if __name__ == '__main__':
     parser.add_argument('--cuda', type=int, default=1)
     parser.add_argument('--mgpu', type=int, default=1)
     parser.add_argument('--restart_train', type=int, default=1)
+    parser.add_argument('--pretrained', type=str, default=None,
+                        help='Path to pretrained checkpoint for transfer learning (partial weight loading)')
 
     # 数据增广（训练集用，验证集强制不用）
     parser.add_argument('--aug_enable', type=int, default=0)
     parser.add_argument('--aug_crop_enable', type=int, default=1)
-    parser.add_argument('--aug_crop_size', type=int, default=512)
-    parser.add_argument('--aug_crop_even_offset', type=int, default=1)
+    parser.add_argument('--aug_crop_size', type=int, default=256) # 减半
+    parser.add_argument('--aug_crop_sizes', type=str, default="96x192,192x384,384x768") # 减半
+    parser.add_argument('--aug_crop_even_offset', type=int, default=0) # Packing后无需强制偶数
+    parser.add_argument('--aug_geo_enable', type=int, default=0)
+    parser.add_argument('--aug_geo_flip_enable', type=int, default=1)
+    parser.add_argument('--aug_geo_rot90_enable', type=int, default=1)
+    parser.add_argument('--aug_exp_enable', type=int, default=0)
+    parser.add_argument('--aug_exp_low_min', type=float, default=0.9)
+    parser.add_argument('--aug_exp_low_max', type=float, default=1.1)
+    parser.add_argument('--aug_exp_mid_min', type=float, default=0.9)
+    parser.add_argument('--aug_exp_mid_max', type=float, default=1.1)
+    parser.add_argument('--aug_exp_high_min', type=float, default=0.9)
+    parser.add_argument('--aug_exp_high_max', type=float, default=1.1)
+    parser.add_argument('--aug_exp_global', type=int, default=0)
+    parser.add_argument('--aug_wb_enable', type=int, default=0)
+    parser.add_argument('--aug_wb_gain_delta', type=float, default=0.05)
     parser.add_argument('--aug_noise_enable', type=int, default=0)
     parser.add_argument('--aug_noise_std', type=float, default=0.0)
 
@@ -348,7 +297,22 @@ if __name__ == '__main__':
         aug_enable=bool(args.aug_enable),
         aug_crop_enable=bool(args.aug_crop_enable),
         aug_crop_size=args.aug_crop_size,
+        aug_crop_sizes=parse_crop_sizes(args.aug_crop_sizes),
         aug_crop_even_offset=bool(args.aug_crop_even_offset),
+        aug_geo_enable=bool(args.aug_geo_enable),
+        aug_geo_flip_enable=bool(args.aug_geo_flip_enable),
+        aug_geo_rot90_enable=bool(args.aug_geo_rot90_enable),
+        aug_exp_enable=bool(args.aug_exp_enable),
+        aug_exp_low_min=args.aug_exp_low_min,
+        aug_exp_low_max=args.aug_exp_low_max,
+        aug_exp_mid_min=args.aug_exp_mid_min,
+        aug_exp_mid_max=args.aug_exp_mid_max,
+        aug_exp_high_min=args.aug_exp_high_min,
+        aug_exp_high_max=args.aug_exp_high_max,
+        aug_exp_global=bool(args.aug_exp_global),
+        aug_wb_enable=bool(args.aug_wb_enable),
+        aug_wb_gain_delta=args.aug_wb_gain_delta,
         aug_noise_enable=bool(args.aug_noise_enable),
         aug_noise_std=args.aug_noise_std,
+        pretrained_path=args.pretrained,
     )

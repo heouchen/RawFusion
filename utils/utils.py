@@ -1,9 +1,13 @@
 import torch
+import numpy as np
 from skimage import metrics
 
 from skimage.color import rgb2gray
 
+import os
 import cv2
+
+from utils.checkpoint import load_checkpoint, load_model_state_dict, load_pretrained_weights
 class MovingAverage(object):
     def __init__(self, n):
         self.n = n
@@ -53,3 +57,53 @@ def calculate_ssim(output_img, target_img):
             data_range=1.0)
         n += 1.0
     return ssim / n
+
+
+def resume_or_load(model, optimizer, scheduler, scaler, use_amp,
+                   restart_train, checkpoint_dir, pretrained_path,
+                   log_txt_path):
+    """
+    模型加载与重训练逻辑。
+    根据 restart_train / pretrained_path 决定：
+      - 续训：从 checkpoint 恢复 model/optimizer/scheduler/scaler 状态
+      - 预训练迁移：部分加载权重
+      - 从零开始训练
+
+    Returns:
+        (start_epoch, global_step, best_loss, log_txt_path, log_header_written)
+    """
+    if not restart_train:
+        try:
+            checkpoint = load_checkpoint(checkpoint_dir, 'best')
+            start_epoch = checkpoint['epoch']
+            global_step = checkpoint['global_iter']
+            best_loss = checkpoint['best_loss']
+            load_model_state_dict(model, checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            if use_amp and 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
+            log_header_written = False
+            if 'log_path' in checkpoint:
+                log_txt_path = checkpoint['log_path']
+                log_header_written = True  # 续训时已有表头，只追加
+            print('=> loaded checkpoint (epoch {}, global_step {})'.format(start_epoch, global_step))
+            return start_epoch, global_step, best_loss, log_txt_path, log_header_written
+        except Exception as e:
+            start_epoch = 0
+            global_step = 0
+            best_loss = np.inf
+            print(f'=> no checkpoint file to be loaded. Reason: {e}')
+            return start_epoch, global_step, best_loss, log_txt_path, False
+    elif pretrained_path:
+        # 从预训练模型加载权重（支持跨模型迁移，只加载匹配的key）
+        try:
+            load_pretrained_weights(model, pretrained_path)
+        except Exception as e:
+            print(f'=> failed to load pretrained weights: {e}')
+        return 0, 0, np.inf, log_txt_path, False
+    else:
+        if not os.path.exists(checkpoint_dir):
+            os.mkdir(checkpoint_dir)
+        print('=> training from scratch')
+        return 0, 0, np.inf, log_txt_path, False
