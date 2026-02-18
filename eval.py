@@ -1,133 +1,246 @@
 """
-We refer the code made from
-https://github.com/z-bingo/kernel-prediction-networks-PyTorch/blob/master/train_eval_syn.py
-"""
+Evaluation script for HDR Burst Reconstruction models.
 
+Features:
+  - Accepts model name via CLI, auto-builds the model
+  - Auto-finds the best checkpoint (model_best.pth.tar) from checkpoint_dir
+  - Saves validation outputs as 96-bit TIF (float32 x 3ch) for NTIRE submission
+  - Reports per-scene and average PSNR / SSIM
+  - Creates img/ folder under the checkpoint dir for output images
+
+Usage:
+  python eval.py --model safnet_claude_5 --exp_name model_cmp_claude5
+  python eval.py --model safnet_claude_6 --exp_name model_cmp_claude6 --save_gt
+"""
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import cv2
 import numpy as np
-from fvcore.nn import FlopCountAnalysis, flop_count_table
-import os, time
+import os
+import time
+import argparse
+import glob
 
 from torchvision.transforms import transforms
 from DataLoader.custom_data_class import CustomDataset
-from models.unet_model import UNet
-
-from utils.utils import *
-from utils.checkpoint import *
-
+from models import build_model, MODEL_NAMES
+from utils.utils import calculate_psnr, calculate_ssim
+from utils.checkpoint import load_checkpoint, load_model_state_dict
 
 
-def eval(cuda, mGPU=True):
-    print('Eval Process......')
+def find_best_checkpoint(checkpoint_dir):
+    """Auto-find the best checkpoint in checkpoint_dir.
 
-    checkpoint_dir = './checkpoint_dir'
-    if not os.path.exists(checkpoint_dir) or len(os.listdir(checkpoint_dir)) == 0:
-        print('There is no any checkpoint file in path:{}'.format(checkpoint_dir))
-    # the path for saving eval images
-    eval_dir = './res'
-    if not os.path.exists(eval_dir):
-        os.mkdir(eval_dir)
-
-    # dataset and dataloader
-    data_set = CustomDataset(root_dir="../datasets/val/", transform=transforms.ToTensor(), train=False)
-    data_loader = torch.utils.data.DataLoader(data_set, batch_size=1, shuffle=False)
-    print("Length of the data_loader :", len(data_loader))
-
-
-
+    Priority:
+      1. model_best.pth.tar (saved by training script)
+      2. Highest-numbered .pth.tar (latest epoch)
     """
-        Your model will be loaded here, via submitted pytorch code and trained parameters.
-        You may upload zip file containing my_network.py and my_parameters.pth.tar to the server. 
-        The specific guideline for how to submit your model will be provided later. 
+    best_path = os.path.join(checkpoint_dir, 'model_best.pth.tar')
+    if os.path.exists(best_path):
+        return best_path
+
+    files = sorted(glob.glob(os.path.join(checkpoint_dir, '*.pth.tar')))
+    if files:
+        return files[-1]
+
+    return None
+
+
+def eval_model(
+    model_name,
+    exp_name='default',
+    val_root='/home/chen/data/ntire2026/hdr/validation/',
+    checkpoint_dir_root='./checkpoint_dir',
+    cuda=True,
+    mgpu=True,
+    save_gt=False,
+    save_input=False,
+):
+    """Evaluate a model on the validation set and save output TIF images.
+
+    Args:
+        model_name: Model key (e.g. 'safnet_claude_5')
+        exp_name: Experiment name used during training
+        val_root: Path to validation data
+        checkpoint_dir_root: Root dir containing per-experiment checkpoint folders
+        cuda: Use GPU
+        mgpu: Use DataParallel
+        save_gt: Also save GT images alongside predictions
+        save_input: Also save per-frame input images
     """
-    ## your model here. ####
-    model = UNet(in_channels=9,  # 9 frames concat through channel dimension
-        n_classes=3,        # out channels (RGB)
-        depth=4,
-        wf=6,
-        padding=True,
-        batch_norm=False,
-        up_mode='upconv')
-    
+    print(f'=== Evaluation: {model_name} (exp: {exp_name}) ===\n')
+
+    # ---- Resolve checkpoint directory ----
+    checkpoint_dir = os.path.join(
+        checkpoint_dir_root,
+        f'checkpoint_dir_{model_name}_{exp_name}'
+    )
+    if not os.path.isdir(checkpoint_dir):
+        raise FileNotFoundError(
+            f'Checkpoint directory not found: {checkpoint_dir}\n'
+            f'Available dirs: {os.listdir(checkpoint_dir_root)}'
+        )
+
+    ckpt_path = find_best_checkpoint(checkpoint_dir)
+    if ckpt_path is None:
+        raise FileNotFoundError(
+            f'No checkpoint found in {checkpoint_dir}'
+        )
+    print(f'=> Checkpoint: {ckpt_path}')
+
+    # ---- Output image directory (inside checkpoint dir) ----
+    img_dir = os.path.join(checkpoint_dir, 'img')
+    os.makedirs(img_dir, exist_ok=True)
+    print(f'=> Output images will be saved to: {img_dir}')
+
+    # ---- Dataset ----
+    val_set = CustomDataset(
+        root_dir=val_root,
+        transform=transforms.ToTensor(),
+        train=False,
+        augment=None,
+    )
+    val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0)
+    scene_ids = val_set.scene_ids
+    print(f'=> Validation scenes: {len(val_loader)}')
+
+    # ---- Model ----
+    model = build_model(model_name)
     if cuda:
         model = model.cuda()
-
-    if mGPU:
+    if mgpu:
         model = nn.DataParallel(model)
 
-    # load trained model parameters
-    # model.load_state_dict(torch.load('./submission/my_parameters.pth', weights_only=True))
-    checkpoint = load_checkpoint(checkpoint_dir, 'best')
-    start_epoch = checkpoint['epoch']
-    global_step = checkpoint['global_iter']
-    best_loss = checkpoint['best_loss']
-    model.load_state_dict(checkpoint['state_dict'])
+    # ---- Load weights ----
+    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    load_model_state_dict(model, checkpoint['state_dict'])
+    epoch = checkpoint.get('epoch', '?')
+    best_psnr = checkpoint.get('best_psnr', checkpoint.get('best_loss', '?'))
+    print(f'=> Loaded checkpoint (epoch {epoch}, best_psnr {best_psnr})')
 
-    print('=> loaded checkpoint (epoch {}, global_step {})'.format(start_epoch, global_step))
-    print('The model has been completely loaded from the user submission.')
-
-    # parameters and flops
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    flops = FlopCountAnalysis(model, torch.ones(1, 9, 768, 1536).to(device))
-    print(flop_count_table(flops))
-
+    # ---- Param count ----
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"Total # of model parameters : {num_params / 1000 / 1000 :.3f}(M)")
-    print(f"Total FLOPs of the model : {flops.total() / (1000**4) :.3f}(T)")
-    print('\n-------Evaluation started -------\n')
+    print(f'=> Model params: {num_params:,} ({num_params / 1e6:.3f}M)')
 
-
-    # switch the eval mode
+    # ---- Evaluate ----
     model.eval()
-    start_time = time.time()
+    print('\n--- Evaluation started ---\n')
+
+    psnr_total = 0.0
+    ssim_total = 0.0
+    time_total = 0.0
+
     with torch.no_grad():
-        psnr = 0.0
-        ssim = 0.0
-
-        for i, (burst_noise, gt) in enumerate(data_loader):
-
+        for i, (burst_noise, gt) in enumerate(val_loader):
+            scene_id = scene_ids[i]
             t0 = time.time()
-            if cuda:
-                burst_noise = burst_noise.cuda()
-                gt = gt.cuda()
 
-            burst_noise = burst_noise.squeeze(2)
+            if cuda:
+                burst_noise = burst_noise.cuda(non_blocking=True)
+                gt = gt.cuda(non_blocking=True)
+
+            # burst_noise: (B, 9, 4, H, W) -> (B, 36, H, W)
+            b, f, c, h, w = burst_noise.shape
+            burst_noise = burst_noise.view(b, f * c, h, w)
+
             pred = model(burst_noise)
-            
-            psnr_t = calculate_psnr(pred.unsqueeze(1), gt.unsqueeze(1))
-            ssim_t = calculate_ssim(pred.unsqueeze(1), gt.unsqueeze(1))
-            # ssim_t=psnr_t
-            psnr += psnr_t
-            ssim += ssim_t
             pred = torch.clamp(pred, 0.0, 1.0)
+
             t1 = time.time()
+            elapsed = t1 - t0
+            time_total += elapsed
 
-            if cuda:
-                pred = pred.cpu()
-                gt = gt.cpu()
-                burst_noise = burst_noise.cpu()
-            print('{}-th image is completed.\t| PSNR: {:.2f}dB\t| SSIM: {:.4f}\t| time: {:.2f} seconds.'.format(i, psnr_t, ssim_t, t1 - t0))
+            # Compute metrics
+            psnr_val = calculate_psnr(pred.unsqueeze(1), gt.unsqueeze(1))
+            ssim_val = calculate_ssim(pred.unsqueeze(1), gt.unsqueeze(1))
+            psnr_total += psnr_val
+            ssim_total += ssim_val
 
-            # to save the output image
-            names = os.listdir("../datasets/val/")
-            ii = i * 10
+            print(f'Scene-{scene_id:03d} | PSNR: {psnr_val:.2f} dB | '
+                  f'SSIM: {ssim_val:.4f} | time: {elapsed:.2f}s')
 
-            cv2.imwrite(eval_dir + f'/' + names[ii][:-6] + f'out.tif', (pred[0]*255).permute(1,2,0).cpu().numpy().astype(np.uint8))
-            cv2.imwrite(eval_dir + f'/' + names[ii][:-6] + f'gt.tif', (gt[0]*255).permute(1,2,0).cpu().numpy().astype(np.uint8))
-            
-            
-            for frame in range(9):
-                # save input frames
-                cv2.imwrite(eval_dir + f'/' + names[ii][:-6] + f'input{frame}.tif', (burst_noise[0][frame] * 255).cpu().numpy().astype(np.uint8))
+            # ---- Save output as 96-bit TIF (float32 x 3ch) ----
+            # pred: (1, 3, H, W) -> (H, W, 3) float32, BGR for cv2
+            pred_np = pred[0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+            # Model outputs RGB, cv2.imwrite expects BGR
+            pred_bgr = pred_np[:, :, ::-1]
+            out_path = os.path.join(img_dir, f'Scene-{scene_id:03d}-out.tif')
+            cv2.imwrite(out_path, pred_bgr)
 
-            
-    end_time = time.time()
-    print('All images are OK, average PSNR: {:.2f}dB, SSIM: {:.4f}'.format(psnr/(i+1), ssim/(i+1)))
-    print(f'Total Validation time : {end_time - start_time : .2f} seconds.')
+            if save_gt:
+                gt_np = gt[0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+                gt_bgr = gt_np[:, :, ::-1]
+                gt_path = os.path.join(img_dir, f'Scene-{scene_id:03d}-gt.tif')
+                cv2.imwrite(gt_path, gt_bgr)
+
+            if save_input:
+                burst_cpu = burst_noise[0].cpu()  # (36, H, W)
+                for frame_idx in range(9):
+                    # Each frame is 4ch packed, save first channel as grayscale
+                    frame = burst_cpu[frame_idx * 4]  # (H, W)
+                    frame_np = frame.numpy().astype(np.float32)
+                    inp_path = os.path.join(
+                        img_dir, f'Scene-{scene_id:03d}-in-{frame_idx}.tif'
+                    )
+                    cv2.imwrite(inp_path, frame_np)
+
+    n_scenes = len(val_loader)
+    avg_psnr = psnr_total / n_scenes
+    avg_ssim = ssim_total / n_scenes
+
+    print(f'\n--- Results ---')
+    print(f'Average PSNR: {avg_psnr:.2f} dB')
+    print(f'Average SSIM: {avg_ssim:.4f}')
+    print(f'Total time:   {time_total:.2f}s ({time_total / n_scenes:.2f}s/scene)')
+    print(f'Output saved: {img_dir}')
+
+    # ---- Verify output format ----
+    sample_out = os.path.join(img_dir, f'Scene-{scene_ids[0]:03d}-out.tif')
+    verify = cv2.imread(sample_out, cv2.IMREAD_UNCHANGED)
+    if verify is not None:
+        print(f'\n=> Output format check: shape={verify.shape}, '
+              f'dtype={verify.dtype}, '
+              f'bits={verify.dtype.itemsize * 8 * verify.shape[2]}bit '
+              f'({verify.dtype.itemsize * 8}bit x {verify.shape[2]}ch)')
+        assert verify.dtype == np.float32, \
+            f'ERROR: expected float32, got {verify.dtype}'
+        assert len(verify.shape) == 3 and verify.shape[2] == 3, \
+            f'ERROR: expected 3-channel, got shape {verify.shape}'
+        print('=> Format OK: 96-bit depth (32bit x 3ch) float32 TIF')
+
+    return avg_psnr, avg_ssim
+
 
 if __name__ == '__main__':
-    eval(cuda=True, mGPU=2)
+    parser = argparse.ArgumentParser(
+        description='Evaluate HDR Burst Reconstruction model')
+    parser.add_argument('--model', type=str, required=True, choices=MODEL_NAMES,
+                        help='Model name')
+    parser.add_argument('--exp_name', type=str, default='default',
+                        help='Experiment name (must match training exp_name)')
+    parser.add_argument('--val_root', type=str,
+                        default='/home/chen/data/ntire2026/hdr/validation/',
+                        help='Path to validation data')
+    parser.add_argument('--checkpoint_dir', type=str,
+                        default='./checkpoint_dir',
+                        help='Root directory containing checkpoint folders')
+    parser.add_argument('--cuda', type=int, default=1)
+    parser.add_argument('--mgpu', type=int, default=1)
+    parser.add_argument('--save_gt', action='store_true',
+                        help='Also save GT images')
+    parser.add_argument('--save_input', action='store_true',
+                        help='Also save input frame images')
+    args = parser.parse_args()
+
+    eval_model(
+        model_name=args.model,
+        exp_name=args.exp_name,
+        val_root=args.val_root,
+        checkpoint_dir_root=args.checkpoint_dir,
+        cuda=bool(args.cuda),
+        mgpu=bool(args.mgpu),
+        save_gt=args.save_gt,
+        save_input=args.save_input,
+    )
