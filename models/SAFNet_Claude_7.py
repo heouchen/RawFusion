@@ -1,16 +1,19 @@
 """
-SAFNet_Claude_6 — Large Kernel DW-Conv (ConvNeXt Style)
-=======================================================
-Core innovation: Replace DW 3x3 with DW 7x7 in HybridBlock to enlarge
-receptive field without dilation. 7x7 depthwise conv already provides
-sufficient spatial coverage, making multi-scale dilation unnecessary.
+SAFNet_Claude_7 — SimpleGate + SCA (NAFNet Style)
+==================================================
+Core innovation: Replace GELU activation with SimpleGate gating mechanism,
+and replace SE attention with Simple Channel Attention (SCA).
 
-Reference: ConvNeXt (CVPR 2022), RepLKNet (CVPR 2022)
+SimpleGate: PW expands to 3x channels, split in half (1.5x each),
+element-wise multiply -> 1.5x channels output (no activation function).
+SCA: GAP -> 1x1 conv (no reduction, no activation) -> channel weights.
+
+Reference: NAFNet (ECCV 2022) — Simple Baselines for Image Restoration
 
 Changes from Claude_5:
-  - HybridBlock DW kernel: 3x3 -> 7x7, padding=3
-  - Dilation removed (all dilation=1)
-  - 8 blocks, 72ch (unchanged)
+  - GELU -> SimpleGate (3x expand, chunk(2), multiply)
+  - SE -> SCA (no bottleneck, no sigmoid)
+  - 8 blocks, 80ch (20+40+20)
 """
 import numpy as np
 import torch
@@ -127,39 +130,40 @@ class DeformConvRelu(nn.Module):
         return self.prelu(self.deform(x, offset))
 
 
-# ======================== LargeKernelBlock ========================
-class LargeKernelBlock(nn.Module):
+# ======================== NAFBlock ========================
+class NAFBlock(nn.Module):
     """
-    ConvNeXt-style block: inverted bottleneck with 7x7 depthwise conv + SE.
-    The large kernel provides wide receptive field without needing dilation.
+    NAFNet-style block: SimpleGate gating + Simple Channel Attention.
+    - PW expand to 3x channels, DW 3x3, SimpleGate (chunk in half, multiply),
+      SCA (GAP -> 1x1 conv, no reduction/activation), PW project back.
+    - No nonlinear activation — gating provides implicit nonlinearity.
     """
-    def __init__(self, channels, se_reduction=4, expand_ratio=2):
+    def __init__(self, channels, dilation=1):
         super().__init__()
-        expand_ch = channels * expand_ratio
-        se_ch = max(expand_ch // se_reduction, 8)
+        expand_ch = channels * 3  # 3x expand for SimpleGate
+        gate_ch = expand_ch // 2  # after SimpleGate chunk(2) and multiply
 
         self.norm = nn.GroupNorm(1, channels)
         self.pw1 = nn.Conv2d(channels, expand_ch, 1, bias=True)
-        # 7x7 depthwise conv (no dilation needed)
-        self.dw = nn.Conv2d(expand_ch, expand_ch, 7, 1, 3,
+        self.dw = nn.Conv2d(expand_ch, expand_ch, 3, 1, dilation, dilation,
                             groups=expand_ch, bias=True)
-        self.act = nn.GELU()
-        self.se = nn.Sequential(
+        # SCA: Simple Channel Attention (no reduction, no activation)
+        self.sca = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(expand_ch, se_ch, 1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(se_ch, expand_ch, 1, bias=True),
-            nn.Sigmoid()
+            nn.Conv2d(gate_ch, gate_ch, 1, bias=True),
         )
-        self.pw2 = nn.Conv2d(expand_ch, channels, 1, bias=True)
+        self.pw2 = nn.Conv2d(gate_ch, channels, 1, bias=True)
         self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
 
     def forward(self, x):
         y = self.norm(x)
         y = self.pw1(y)
         y = self.dw(y)
-        y = self.act(y)
-        y = y * self.se(y)
+        # SimpleGate: split in half and multiply (no activation)
+        y1, y2 = y.chunk(2, dim=1)
+        y = y1 * y2
+        # SCA
+        y = y * self.sca(y)
         y = self.pw2(y)
         return x + y * self.scale
 
@@ -221,8 +225,8 @@ class Decoder(nn.Module):
 class RefineNet(nn.Module):
     def __init__(self, img_channels=4):
         super().__init__()
-        c0, c1, c2 = 18, 36, 18
-        total_c = c0 + c1 + c2  # 72
+        c0, c1, c2 = 20, 40, 20
+        total_c = c0 + c1 + c2  # 80
 
         self.conv0 = nn.Sequential(convrelu(img_channels, c0), convrelu(c0, c0))
         self.conv1 = nn.Sequential(
@@ -230,9 +234,10 @@ class RefineNet(nn.Module):
             convrelu(c1, c1))
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), convrelu(c2, c2))
 
-        # 8 LargeKernelBlocks — all dilation=1 (7x7 provides sufficient RF)
+        # 8 NAFBlocks with symmetric dilation pattern
+        dilations = [1, 1, 2, 4, 4, 2, 1, 1]
         self.blocks = nn.Sequential(*[
-            LargeKernelBlock(total_c) for _ in range(8)
+            NAFBlock(total_c, dilation=d) for d in dilations
         ])
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
@@ -257,8 +262,8 @@ class RefineNet(nn.Module):
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
 
-# ======================== SAFNet_Claude_6 ========================
-class SAFNet_Claude_6(nn.Module):
+# ======================== SAFNet_Claude_7 ========================
+class SAFNet_Claude_7(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
@@ -344,7 +349,7 @@ class SAFNet_Claude_6(nn.Module):
 
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = SAFNet_Claude_6().to(device)
+    model = SAFNet_Claude_7().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
     from ptflops import get_model_complexity_info

@@ -107,18 +107,17 @@ class HDRBurstAugment:
             target = torch.rot90(target, k=rot_k, dims=[-2, -1])
         return inputs, target
 
-    def _apply_exposure_jitter(self, inputs: torch.Tensor):
-        # inputs: (9, 4, H, W)
-        
+    def _apply_exposure_jitter(self, inputs: torch.Tensor, target: torch.Tensor):
+        # inputs: (9, 4, H, W), target: (3, H*2, W*2)
+
         if self.exp_global:
-            # 全局增益：所有帧乘同一个系数 (模拟场景亮度变化)
+            # 全局增益：所有帧和 GT 乘同一个系数 (模拟场景亮度变化)
             # 使用 mid range 作为全局范围
             lo, hi = self.exp_range_mid
             g = (hi - lo) * torch.rand(1).item() + lo
-            # g: scalar
-            return inputs * g
+            return inputs * g, target * g
         else:
-            # 独立增益：每帧独立随机 (破坏 Burst 物理一致性，仅作强扰动)
+            # 独立增益：每帧独立随机 (模拟帧间曝光抖动，GT 不变)
             ranges = [
                 self.exp_range_low, self.exp_range_low, self.exp_range_low,
                 self.exp_range_mid, self.exp_range_mid, self.exp_range_mid,
@@ -129,25 +128,23 @@ class HDRBurstAugment:
                 g = (hi - lo) * torch.rand(1).item() + lo
                 gains.append(g)
             gains = torch.tensor(gains, dtype=inputs.dtype, device=inputs.device).view(9, 1, 1, 1)
-            return inputs * gains
+            return inputs * gains, target
 
     def _apply_wb_jitter(self, inputs: torch.Tensor):
-        # inputs: (9, 4, H, W)
-        # 仅对 R (index 1) 和 B (index 2) 通道进行白平衡增强（假设 GRBG Packing）
+        # inputs: (9, 4, H, W), packing order: [R, G1, G2, B] (index 0,1,2,3)
         delta = self.wb_gain_delta
         if delta <= 0:
             return inputs
-        
-        # 初始化全 1 增益
-        gains = torch.ones((9, 4, 1, 1), dtype=inputs.dtype, device=inputs.device)
-        
-        # 为 R 和 B 通道生成随机增益 [1-delta, 1+delta]
-        rb_gains = (1.0 - delta) + (2.0 * delta) * torch.rand((9, 2, 1, 1), dtype=inputs.dtype, device=inputs.device)
-        
-        # 赋值到 index 1 (R) 和 index 2 (B)
-        gains[:, 1:3, :, :] = rb_gains
-        
-        return inputs * gains
+
+        # Burst 内所有帧共享相同的 WB 增益（相机 WB 设置在 burst 内不变）
+        r_gain = (1.0 - delta) + (2.0 * delta) * torch.rand(1).item()
+        b_gain = (1.0 - delta) + (2.0 * delta) * torch.rand(1).item()
+
+        gains = torch.ones((1, 4, 1, 1), dtype=inputs.dtype, device=inputs.device)
+        gains[0, 0, 0, 0] = r_gain  # R channel (index 0)
+        gains[0, 3, 0, 0] = b_gain  # B channel (index 3)
+
+        return inputs * gains  # broadcast (1,4,1,1) -> (9,4,H,W)
 
     def __call__(self, inputs: torch.Tensor, target: torch.Tensor):
         if not self.enable:
@@ -161,7 +158,7 @@ class HDRBurstAugment:
             inputs, target = self._apply_geom(inputs, target, geom)
 
         if self.exp_enable:
-            inputs = self._apply_exposure_jitter(inputs)
+            inputs, target = self._apply_exposure_jitter(inputs, target)
 
         if self.wb_enable:
             inputs = self._apply_wb_jitter(inputs)
@@ -195,7 +192,7 @@ class HDRBurstAugment:
             inputs, target = self._apply_geom(inputs, target, geom)
 
         if self.exp_enable:
-            inputs = self._apply_exposure_jitter(inputs)
+            inputs, target = self._apply_exposure_jitter(inputs, target)
 
         if self.wb_enable:
             inputs = self._apply_wb_jitter(inputs)

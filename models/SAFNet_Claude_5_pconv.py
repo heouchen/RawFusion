@@ -1,16 +1,10 @@
 """
-SAFNet_Claude_6 — Large Kernel DW-Conv (ConvNeXt Style)
-=======================================================
-Core innovation: Replace DW 3x3 with DW 7x7 in HybridBlock to enlarge
-receptive field without dilation. 7x7 depthwise conv already provides
-sufficient spatial coverage, making multi-scale dilation unnecessary.
+SAFNet_Claude_5_pconv — PConv variant of Claude_5
+===================================================
+Replaces Encoder stride=1 convolutions with PConvRelu (Pinwheel-shaped Conv),
+while RefineNet uses the same HybridBlock (DW-Sep + SE) as original Claude_5.
 
-Reference: ConvNeXt (CVPR 2022), RepLKNet (CVPR 2022)
-
-Changes from Claude_5:
-  - HybridBlock DW kernel: 3x3 -> 7x7, padding=3
-  - Dilation removed (all dilation=1)
-  - 8 blocks, 72ch (unchanged)
+PConv reference: https://github.com/JN-Yang/PConv-SDloss-Data/blob/main/model/APConv.py
 """
 import numpy as np
 import torch
@@ -66,6 +60,7 @@ def weight_3expo_high_tog17(img):
 
 def merge_hdr_5frame(short_ldr, mid_ldr, long_ldr,
                      short_lin, mid_lin, long_lin, mask0, mask2):
+    """5-frame HDR merge with intra-exposure temporal averaging."""
     avg_short_lin = sum(short_lin) / len(short_lin)
     avg_mid_lin = sum(mid_lin) / len(mid_lin)
     avg_long_lin = sum(long_lin) / len(long_lin)
@@ -127,23 +122,50 @@ class DeformConvRelu(nn.Module):
         return self.prelu(self.deform(x, offset))
 
 
-# ======================== LargeKernelBlock ========================
-class LargeKernelBlock(nn.Module):
+# ======================== PConv Module (Encoder only) ========================
+class PConvRelu(nn.Module):
     """
-    ConvNeXt-style block: inverted bottleneck with 7x7 depthwise conv + SE.
-    The large kernel provides wide receptive field without needing dilation.
+    Pinwheel-shaped Convolution + PReLU, stride=1 only.
+    4 branches: 2x (1,k) + 2x (k,1) with asymmetric padding, fused by 2x2 conv.
     """
-    def __init__(self, channels, se_reduction=4, expand_ratio=2):
+    def __init__(self, in_channels, out_channels, k=3):
+        super().__init__()
+        assert out_channels % 4 == 0, f"out_channels={out_channels} must be divisible by 4"
+        p = [(k, 0, 1, 0), (0, k, 0, 1), (0, 1, k, 0), (1, 0, 0, k)]
+        self.pad = nn.ModuleList([nn.ZeroPad2d(padding=p[g]) for g in range(4)])
+        self.cw = nn.Conv2d(in_channels, out_channels // 4, (1, k), bias=True)
+        self.ch = nn.Conv2d(in_channels, out_channels // 4, (k, 1), bias=True)
+        self.fuse = nn.Conv2d(out_channels, out_channels, 2, bias=True)
+        self.act = nn.PReLU(out_channels)
+
+    def forward(self, x):
+        yw0 = self.cw(self.pad[0](x))
+        yw1 = self.cw(self.pad[1](x))
+        yh0 = self.ch(self.pad[2](x))
+        yh1 = self.ch(self.pad[3](x))
+        return self.act(self.fuse(torch.cat([yw0, yw1, yh0, yh1], dim=1)))
+
+
+# ======================== HybridBlock (RefineNet) ========================
+class HybridBlock(nn.Module):
+    """
+    Inverted bottleneck with depthwise separable conv + SE attention.
+    Combines FLOPs efficiency of DW-Sep with representational power of SE.
+    GELU activation + learnable scaling for stable deep training.
+    """
+    def __init__(self, channels, dilation=1, se_reduction=4, expand_ratio=2):
         super().__init__()
         expand_ch = channels * expand_ratio
         se_ch = max(expand_ch // se_reduction, 8)
 
-        self.norm = nn.GroupNorm(1, channels)
+        self.norm = nn.GroupNorm(1, channels)  # LayerNorm equivalent
+        # 1x1 expand
         self.pw1 = nn.Conv2d(channels, expand_ch, 1, bias=True)
-        # 7x7 depthwise conv (no dilation needed)
-        self.dw = nn.Conv2d(expand_ch, expand_ch, 7, 1, 3,
+        # 3x3 depthwise with dilation
+        self.dw = nn.Conv2d(expand_ch, expand_ch, 3, 1, dilation, dilation,
                             groups=expand_ch, bias=True)
         self.act = nn.GELU()
+        # SE attention on expanded channels
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(expand_ch, se_ch, 1, bias=True),
@@ -151,7 +173,9 @@ class LargeKernelBlock(nn.Module):
             nn.Conv2d(se_ch, expand_ch, 1, bias=True),
             nn.Sigmoid()
         )
+        # 1x1 project back
         self.pw2 = nn.Conv2d(expand_ch, channels, 1, bias=True)
+        # Learnable residual scaling (initialized small for stable training)
         self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
 
     def forward(self, x):
@@ -164,22 +188,22 @@ class LargeKernelBlock(nn.Module):
         return x + y * self.scale
 
 
-# ======================== Encoder ========================
+# ======================== Encoder (PConv for stride=1) ========================
 class Encoder(nn.Module):
     def __init__(self, in_channels=4):
         super().__init__()
         self.pyramid1 = nn.Sequential(
             convrelu(in_channels, 40, 3, 2, 1),
-            convrelu(40, 40, 3, 1, 1))
+            PConvRelu(40, 40))
         self.pyramid2 = nn.Sequential(
             convrelu(40, 40, 3, 2, 1),
-            convrelu(40, 40, 3, 1, 1))
+            PConvRelu(40, 40))
         self.pyramid3 = nn.Sequential(
             convrelu(40, 40, 3, 2, 1),
-            convrelu(40, 40, 3, 1, 1))
+            PConvRelu(40, 40))
         self.pyramid4 = nn.Sequential(
             convrelu(40, 40, 3, 2, 1),
-            convrelu(40, 40, 3, 1, 1))
+            PConvRelu(40, 40))
 
     def forward(self, img_c):
         f1 = self.pyramid1(img_c)
@@ -189,7 +213,7 @@ class Encoder(nn.Module):
         return f1, f2, f3, f4
 
 
-# ======================== Decoder ========================
+# ======================== Decoder (same as V2) ========================
 class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -217,7 +241,7 @@ class Decoder(nn.Module):
         return up_flow0, up_flow2, up_mask0, up_mask2
 
 
-# ======================== RefineNet ========================
+# ======================== RefineNet (HybridBlock, 72ch) ========================
 class RefineNet(nn.Module):
     def __init__(self, img_channels=4):
         super().__init__()
@@ -230,10 +254,17 @@ class RefineNet(nn.Module):
             convrelu(c1, c1))
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), convrelu(c2, c2))
 
-        # 8 LargeKernelBlocks — all dilation=1 (7x7 provides sufficient RF)
-        self.blocks = nn.Sequential(*[
-            LargeKernelBlock(total_c) for _ in range(8)
-        ])
+        # 8 HybridBlocks with multi-scale dilation
+        self.blocks = nn.Sequential(
+            HybridBlock(total_c, dilation=1),
+            HybridBlock(total_c, dilation=1),
+            HybridBlock(total_c, dilation=2),
+            HybridBlock(total_c, dilation=4),
+            HybridBlock(total_c, dilation=4),
+            HybridBlock(total_c, dilation=2),
+            HybridBlock(total_c, dilation=1),
+            HybridBlock(total_c, dilation=1),
+        )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
         self.pixel_shuffle = nn.PixelShuffle(2)
@@ -257,8 +288,8 @@ class RefineNet(nn.Module):
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
 
-# ======================== SAFNet_Claude_6 ========================
-class SAFNet_Claude_6(nn.Module):
+# ======================== SAFNet_Claude_5_pconv ========================
+class SAFNet_Claude_5_pconv(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
@@ -310,20 +341,24 @@ class SAFNet_Claude_6(nn.Module):
         return torch.sigmoid(up_mask0_1), torch.sigmoid(up_mask2_1), up_flow0_1, up_flow2_1
 
     def forward(self, x, scale_factor=0.5, refine=True):
-        img0_c = x[:, 0:4, :, :]
-        img2_c = x[:, 8:12, :, :]
-        img4_c = x[:, 16:20, :, :]
-        img6_c = x[:, 24:28, :, :]
-        img8_c = x[:, 32:36, :, :]
+        # ---- Extract 5 frames ----
+        img0_c = x[:, 0:4, :, :]     # Short ref (frame 0)
+        img2_c = x[:, 8:12, :, :]    # Short (frame 2)
+        img4_c = x[:, 16:20, :, :]   # Mid (frame 4)
+        img6_c = x[:, 24:28, :, :]   # Mid (frame 6)
+        img8_c = x[:, 32:36, :, :]   # Long (frame 8)
 
+        # ---- Flow estimation using 3 anchors (0, 4, 8) ----
         mask0, mask8, flow0, flow8 = self.forward_flow_mask(
             img0_c, img4_c, img8_c, scale_factor=scale_factor)
 
+        # ---- Warp all 5 frames ----
         img0_warp = warp(img0_c, flow0)
         img8_warp = warp(img8_c, flow8)
         img2_warp = warp(img2_c, flow0 * 0.67)
         img6_warp = warp(img6_c, flow8 * 0.67)
 
+        # ---- 5-frame HDR merge ----
         img_hdr_m = merge_hdr_5frame(
             short_ldr=[img0_warp[:, :3], img2_warp[:, :3]],
             mid_ldr=[img4_c[:, :3]],
@@ -344,7 +379,7 @@ class SAFNet_Claude_6(nn.Module):
 
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = SAFNet_Claude_6().to(device)
+    model = SAFNet_Claude_5_pconv().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
     from ptflops import get_model_complexity_info

@@ -21,6 +21,7 @@ from DataLoader.collate import make_train_collate, parse_crop_sizes
 from models import build_model, MODEL_NAMES
 from utils.checkpoint import save_checkpoint
 from utils.utils import resume_or_load
+from utils.loss import build_loss, LOSS_NAMES
 from engine import train_one_epoch, validate
 
 
@@ -58,6 +59,7 @@ def train(
     aug_noise_enable=False,
     aug_noise_std=0.0,
     pretrained_path=None,
+    loss_name='mulaw_l1',
 ):
     torch.set_num_threads(num_threads)
 
@@ -150,10 +152,15 @@ def train(
     model = build_model(model_name)
     print(f'=> Using {model_name} model')
 
+    # 损失函数
+    loss_fn = build_loss(loss_name)
+    print(f'=> Loss function: {loss_name}')
+
     print('\n-------Training started -------\n')
 
     if cuda:
         model = model.cuda()
+        loss_fn = loss_fn.cuda()
 
     if mGPU:
         model = nn.DataParallel(model)
@@ -162,10 +169,10 @@ def train(
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
     optimizer.zero_grad()
-    scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=lr_decay)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epoch, eta_min=1e-6)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-    start_epoch, global_step, best_loss, log_txt_path, log_header_written = resume_or_load(
+    start_epoch, global_step, best_psnr, log_txt_path, log_header_written = resume_or_load(
         model, optimizer, scheduler, scaler, use_amp,
         restart_train, checkpoint_dir, pretrained_path, log_txt_path
     )
@@ -188,7 +195,7 @@ def train(
 
         avg_train_loss, step_count = train_one_epoch(
             model, data_loader, optimizer, scaler, use_amp, cuda,
-            epoch, n_epoch, output_dir
+            epoch, n_epoch, output_dir, loss_fn=loss_fn
         )
         global_step += step_count
         epoch_time = time.time() - epoch_start_time
@@ -207,10 +214,10 @@ def train(
                 log_header_written = True
             f.write(f'{epoch}\t{avg_train_loss:.6f}\t{val_psnr:.6f}\t{val_ssim:.6f}\t{epoch_time:.2f}\t{lr_current:.8f}\n')
 
-        # 每个 epoch 都判断 is_best，确保不遗漏最优模型
-        if avg_train_loss < best_loss:
+        # 基于 val PSNR 判断 is_best（而非 train loss，避免增广实验偏置）
+        if val_psnr > best_psnr:
             is_best = True
-            best_loss = avg_train_loss
+            best_psnr = val_psnr
         else:
             is_best = False
 
@@ -219,7 +226,7 @@ def train(
                 'epoch': epoch + 1,
                 'global_iter': global_step,
                 'state_dict': model.state_dict(),
-                'best_loss': best_loss,
+                'best_psnr': best_psnr,
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': scheduler.state_dict(),
                 'log_path': log_txt_path,
@@ -233,10 +240,6 @@ def train(
 
         # decay the learning rate
         scheduler.step()
-        # 学习率下限保护
-        for param in optimizer.param_groups:
-            if param['lr'] < 5e-6:
-                param['lr'] = 5e-6
 
 
 
@@ -256,6 +259,8 @@ if __name__ == '__main__':
     parser.add_argument('--restart_train', type=int, default=1)
     parser.add_argument('--pretrained', type=str, default=None,
                         help='Path to pretrained checkpoint for transfer learning (partial weight loading)')
+    parser.add_argument('--loss', type=str, default='mulaw_l1', choices=LOSS_NAMES,
+                        help='Loss function name')
 
     # 数据增广（训练集用，验证集强制不用）
     parser.add_argument('--aug_enable', type=int, default=0)
@@ -315,4 +320,5 @@ if __name__ == '__main__':
         aug_noise_enable=bool(args.aug_noise_enable),
         aug_noise_std=args.aug_noise_std,
         pretrained_path=args.pretrained,
+        loss_name=args.loss,
     )

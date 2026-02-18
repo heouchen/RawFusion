@@ -70,14 +70,15 @@ def resume_or_load(model, optimizer, scheduler, scaler, use_amp,
       - 从零开始训练
 
     Returns:
-        (start_epoch, global_step, best_loss, log_txt_path, log_header_written)
+        (start_epoch, global_step, best_psnr, log_txt_path, log_header_written)
     """
     if not restart_train:
         try:
             checkpoint = load_checkpoint(checkpoint_dir, 'best')
             start_epoch = checkpoint['epoch']
             global_step = checkpoint['global_iter']
-            best_loss = checkpoint['best_loss']
+            # 兼容旧 checkpoint（best_loss → best_psnr）
+            best_psnr = checkpoint.get('best_psnr', 0.0)
             load_model_state_dict(model, checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -88,22 +89,22 @@ def resume_or_load(model, optimizer, scheduler, scaler, use_amp,
                 log_txt_path = checkpoint['log_path']
                 log_header_written = True  # 续训时已有表头，只追加
             print('=> loaded checkpoint (epoch {}, global_step {})'.format(start_epoch, global_step))
-            return start_epoch, global_step, best_loss, log_txt_path, log_header_written
+            return start_epoch, global_step, best_psnr, log_txt_path, log_header_written
         except Exception as e:
             start_epoch = 0
             global_step = 0
-            best_loss = np.inf
+            best_psnr = 0.0
             print(f'=> no checkpoint file to be loaded. Reason: {e}')
-            return start_epoch, global_step, best_loss, log_txt_path, False
+            return start_epoch, global_step, best_psnr, log_txt_path, False
     elif pretrained_path:
         # 从预训练模型加载权重（支持跨模型迁移，只加载匹配的key）
         try:
             load_pretrained_weights(model, pretrained_path)
         except Exception as e:
             print(f'=> failed to load pretrained weights: {e}')
-        return 0, 0, np.inf, log_txt_path, False
+        return 0, 0, 0.0, log_txt_path, False
     else:
         if not os.path.exists(checkpoint_dir):
             os.mkdir(checkpoint_dir)
         print('=> training from scratch')
-        return 0, 0, np.inf, log_txt_path, False
+        return 0, 0, 0.0, log_txt_path, False

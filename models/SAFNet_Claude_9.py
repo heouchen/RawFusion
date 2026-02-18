@@ -1,16 +1,19 @@
 """
-SAFNet_Claude_6 — Large Kernel DW-Conv (ConvNeXt Style)
-=======================================================
-Core innovation: Replace DW 3x3 with DW 7x7 in HybridBlock to enlarge
-receptive field without dilation. 7x7 depthwise conv already provides
-sufficient spatial coverage, making multi-scale dilation unnecessary.
+SAFNet_Claude_9 — FFT-Enhanced Block
+=====================================
+Core innovation: Add a parallel frequency-domain branch inside HybridBlock.
+After DW conv + GELU, an FFT branch processes features in spectral domain
+via per-channel complex-valued 2x2 transform, then fuses with the spatial
+branch through learnable weights. Captures global frequency patterns that
+local convolutions miss.
 
-Reference: ConvNeXt (CVPR 2022), RepLKNet (CVPR 2022)
+Reference: FocalNet (NeurIPS 2022), FFTformer (ICML 2023)
 
 Changes from Claude_5:
-  - HybridBlock DW kernel: 3x3 -> 7x7, padding=3
-  - Dilation removed (all dilation=1)
-  - 8 blocks, 72ch (unchanged)
+  - FFT branch added after DW conv, before SE
+  - Per-channel complex spectral filter (grouped 1x1 conv on real+imag)
+  - Learnable spatial/frequency fusion weights
+  - 7 blocks (reduced from 8), 72ch
 """
 import numpy as np
 import torch
@@ -127,23 +130,36 @@ class DeformConvRelu(nn.Module):
         return self.prelu(self.deform(x, offset))
 
 
-# ======================== LargeKernelBlock ========================
-class LargeKernelBlock(nn.Module):
+# ======================== FFTBlock ========================
+class FFTBlock(nn.Module):
     """
-    ConvNeXt-style block: inverted bottleneck with 7x7 depthwise conv + SE.
-    The large kernel provides wide receptive field without needing dilation.
+    HybridBlock with parallel FFT branch for global frequency processing.
+    After DW conv + GELU, features are processed in both spatial and
+    frequency domains, then fused with learnable weights before SE.
+
+    FFT branch: rfft2 -> per-channel complex transform (grouped 1x1 conv
+    on stacked real+imag, groups=expand_ch for 2x2 complex mixing per
+    channel) -> irfft2 -> weighted fusion with spatial branch.
     """
-    def __init__(self, channels, se_reduction=4, expand_ratio=2):
+    def __init__(self, channels, dilation=1, se_reduction=4, expand_ratio=2):
         super().__init__()
         expand_ch = channels * expand_ratio
         se_ch = max(expand_ch // se_reduction, 8)
 
         self.norm = nn.GroupNorm(1, channels)
         self.pw1 = nn.Conv2d(channels, expand_ch, 1, bias=True)
-        # 7x7 depthwise conv (no dilation needed)
-        self.dw = nn.Conv2d(expand_ch, expand_ch, 7, 1, 3,
+        self.dw = nn.Conv2d(expand_ch, expand_ch, 3, 1, dilation, dilation,
                             groups=expand_ch, bias=True)
         self.act = nn.GELU()
+
+        # FFT branch: per-channel complex-valued 2x2 transform
+        # Groups=expand_ch means each group has 2 in (real,imag) -> 2 out
+        self.fft_conv = nn.Conv2d(expand_ch * 2, expand_ch * 2, 1,
+                                  groups=expand_ch, bias=True)
+        # Learnable fusion weights (spatial vs frequency)
+        self.spatial_weight = nn.Parameter(torch.ones(1) * 0.9)
+        self.fft_weight = nn.Parameter(torch.ones(1) * 0.1)
+
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(expand_ch, se_ch, 1, bias=True),
@@ -159,6 +175,20 @@ class LargeKernelBlock(nn.Module):
         y = self.pw1(y)
         y = self.dw(y)
         y = self.act(y)
+
+        # FFT branch
+        _, _, H, W = y.shape
+        fft_y = torch.fft.rfft2(y, norm='ortho')
+        # Stack real and imag as interleaved channels for grouped conv
+        fft_features = torch.cat([fft_y.real, fft_y.imag], dim=1)
+        fft_features = self.fft_conv(fft_features)
+        fft_real, fft_imag = fft_features.chunk(2, dim=1)
+        fft_out = torch.fft.irfft2(
+            torch.complex(fft_real, fft_imag), s=(H, W), norm='ortho')
+
+        # Weighted fusion of spatial and frequency branches
+        y = self.spatial_weight * y + self.fft_weight * fft_out
+
         y = y * self.se(y)
         y = self.pw2(y)
         return x + y * self.scale
@@ -230,9 +260,10 @@ class RefineNet(nn.Module):
             convrelu(c1, c1))
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), convrelu(c2, c2))
 
-        # 8 LargeKernelBlocks — all dilation=1 (7x7 provides sufficient RF)
+        # 7 FFTBlocks with symmetric dilation
+        dilations = [1, 1, 2, 4, 2, 1, 1]
         self.blocks = nn.Sequential(*[
-            LargeKernelBlock(total_c) for _ in range(8)
+            FFTBlock(total_c, dilation=d) for d in dilations
         ])
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
@@ -257,8 +288,8 @@ class RefineNet(nn.Module):
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
 
-# ======================== SAFNet_Claude_6 ========================
-class SAFNet_Claude_6(nn.Module):
+# ======================== SAFNet_Claude_9 ========================
+class SAFNet_Claude_9(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
@@ -344,7 +375,7 @@ class SAFNet_Claude_6(nn.Module):
 
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = SAFNet_Claude_6().to(device)
+    model = SAFNet_Claude_9().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
     from ptflops import get_model_complexity_info

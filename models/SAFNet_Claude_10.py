@@ -1,16 +1,20 @@
 """
-SAFNet_Claude_6 — Large Kernel DW-Conv (ConvNeXt Style)
-=======================================================
-Core innovation: Replace DW 3x3 with DW 7x7 in HybridBlock to enlarge
-receptive field without dilation. 7x7 depthwise conv already provides
-sufficient spatial coverage, making multi-scale dilation unnecessary.
+SAFNet_Claude_10 — Wider + DropPath + Dense Skip
+=================================================
+Core innovation: Increase width to 80ch, add DropPath (stochastic depth)
+regularization, and dense residual connections every 3 blocks (RDG-style).
 
-Reference: ConvNeXt (CVPR 2022), RepLKNet (CVPR 2022)
+- DropPath: linearly increasing drop probability across blocks (0 -> 0.1)
+- Dense skip: every 3 blocks, concat group input + output -> 1x1 compress
+  back to 80ch (similar to Residual Dense Group in RDN)
+- Block structure unchanged (DW-Sep + SE)
+
+Reference: DenseNet (CVPR 2017), Stochastic Depth (ECCV 2016), RDN (CVPR 2018)
 
 Changes from Claude_5:
-  - HybridBlock DW kernel: 3x3 -> 7x7, padding=3
-  - Dilation removed (all dilation=1)
-  - 8 blocks, 72ch (unchanged)
+  - Width: 72ch -> 80ch (20+40+20)
+  - Blocks: 8 -> 7 with DropPath
+  - Dense skip connections every 3 blocks
 """
 import numpy as np
 import torch
@@ -127,21 +131,40 @@ class DeformConvRelu(nn.Module):
         return self.prelu(self.deform(x, offset))
 
 
-# ======================== LargeKernelBlock ========================
-class LargeKernelBlock(nn.Module):
-    """
-    ConvNeXt-style block: inverted bottleneck with 7x7 depthwise conv + SE.
-    The large kernel provides wide receptive field without needing dilation.
-    """
-    def __init__(self, channels, se_reduction=4, expand_ratio=2):
+# ======================== DropPath ========================
+def drop_path(x, drop_prob=0., training=False):
+    """Stochastic depth: randomly drop entire residual branch per sample."""
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+    if keep_prob > 0.:
+        random_tensor.div_(keep_prob)
+    return x * random_tensor
+
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=0.):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
+
+# ======================== HybridBlockDP ========================
+class HybridBlockDP(nn.Module):
+    """HybridBlock (DW-Sep + SE) with DropPath regularization."""
+    def __init__(self, channels, dilation=1, se_reduction=4,
+                 expand_ratio=2, drop_path_rate=0.):
         super().__init__()
         expand_ch = channels * expand_ratio
         se_ch = max(expand_ch // se_reduction, 8)
 
         self.norm = nn.GroupNorm(1, channels)
         self.pw1 = nn.Conv2d(channels, expand_ch, 1, bias=True)
-        # 7x7 depthwise conv (no dilation needed)
-        self.dw = nn.Conv2d(expand_ch, expand_ch, 7, 1, 3,
+        self.dw = nn.Conv2d(expand_ch, expand_ch, 3, 1, dilation, dilation,
                             groups=expand_ch, bias=True)
         self.act = nn.GELU()
         self.se = nn.Sequential(
@@ -153,6 +176,7 @@ class LargeKernelBlock(nn.Module):
         )
         self.pw2 = nn.Conv2d(expand_ch, channels, 1, bias=True)
         self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
 
     def forward(self, x):
         y = self.norm(x)
@@ -161,7 +185,7 @@ class LargeKernelBlock(nn.Module):
         y = self.act(y)
         y = y * self.se(y)
         y = self.pw2(y)
-        return x + y * self.scale
+        return x + self.drop_path(y * self.scale)
 
 
 # ======================== Encoder ========================
@@ -217,12 +241,18 @@ class Decoder(nn.Module):
         return up_flow0, up_flow2, up_mask0, up_mask2
 
 
-# ======================== RefineNet ========================
+# ======================== RefineNet (Dense Skip) ========================
 class RefineNet(nn.Module):
+    """
+    RefineNet with 80ch, 7 HybridBlockDP blocks, dense skip connections.
+    Blocks are grouped: [0,1,2], [3,4,5], [6].
+    After each group of 3, the group input and output are concatenated
+    and compressed back to 80ch via 1x1 conv (RDG-style dense skip).
+    """
     def __init__(self, img_channels=4):
         super().__init__()
-        c0, c1, c2 = 18, 36, 18
-        total_c = c0 + c1 + c2  # 72
+        c0, c1, c2 = 20, 40, 20
+        total_c = c0 + c1 + c2  # 80
 
         self.conv0 = nn.Sequential(convrelu(img_channels, c0), convrelu(c0, c0))
         self.conv1 = nn.Sequential(
@@ -230,10 +260,27 @@ class RefineNet(nn.Module):
             convrelu(c1, c1))
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), convrelu(c2, c2))
 
-        # 8 LargeKernelBlocks — all dilation=1 (7x7 provides sufficient RF)
-        self.blocks = nn.Sequential(*[
-            LargeKernelBlock(total_c) for _ in range(8)
+        # 7 blocks with linearly increasing DropPath rate (0 -> 0.1)
+        num_blocks = 7
+        dpr = [x.item() for x in torch.linspace(0, 0.1, num_blocks)]
+        dilations = [1, 1, 2, 4, 2, 1, 1]
+
+        # Group 1: blocks 0, 1, 2
+        self.group1 = nn.ModuleList([
+            HybridBlockDP(total_c, dilations[i], drop_path_rate=dpr[i])
+            for i in range(3)
         ])
+        self.fuse1 = nn.Conv2d(total_c * 2, total_c, 1, bias=True)
+
+        # Group 2: blocks 3, 4, 5
+        self.group2 = nn.ModuleList([
+            HybridBlockDP(total_c, dilations[i + 3], drop_path_rate=dpr[i + 3])
+            for i in range(3)
+        ])
+        self.fuse2 = nn.Conv2d(total_c * 2, total_c, 1, bias=True)
+
+        # Block 6: standalone (no dense skip needed for single block)
+        self.block6 = HybridBlockDP(total_c, dilations[6], drop_path_rate=dpr[6])
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
         self.pixel_shuffle = nn.PixelShuffle(2)
@@ -249,7 +296,20 @@ class RefineNet(nn.Module):
         feat2_warp = warp(feat2, flow2)
         feat = torch.cat([feat0_warp, feat1, feat2_warp], 1)
 
-        feat = self.blocks(feat)
+        # Group 1 with dense skip
+        group1_in = feat
+        for block in self.group1:
+            feat = block(feat)
+        feat = self.fuse1(torch.cat([group1_in, feat], 1))
+
+        # Group 2 with dense skip
+        group2_in = feat
+        for block in self.group2:
+            feat = block(feat)
+        feat = self.fuse2(torch.cat([group2_in, feat], 1))
+
+        # Standalone block 6
+        feat = self.block6(feat)
 
         res = self.pixel_shuffle(self.conv3(feat))
         img_hdr_m_up = F.interpolate(img_hdr_m, scale_factor=2,
@@ -257,8 +317,8 @@ class RefineNet(nn.Module):
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
 
-# ======================== SAFNet_Claude_6 ========================
-class SAFNet_Claude_6(nn.Module):
+# ======================== SAFNet_Claude_10 ========================
+class SAFNet_Claude_10(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
@@ -344,7 +404,7 @@ class SAFNet_Claude_6(nn.Module):
 
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = SAFNet_Claude_6().to(device)
+    model = SAFNet_Claude_10().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
     from ptflops import get_model_complexity_info

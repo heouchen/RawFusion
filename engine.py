@@ -7,15 +7,12 @@ from PIL import Image
 from torchvision.transforms import transforms
 
 from utils.utils import calculate_psnr, calculate_ssim
-from utils.loss import safnet_loss, CharbonnierLoss
 to_pil_image = transforms.ToPILImage()
-charbonnier_loss = CharbonnierLoss()
 
 def train_one_epoch(model, data_loader, optimizer, scaler, use_amp, cuda,
-                    epoch, n_epoch, output_dir):
+                    epoch, n_epoch, output_dir, loss_fn=None):
     """单 epoch 训练，返回 (avg_loss, step_count)"""
     model.train()
-    MSE_loss = nn.MSELoss()
     lr_current = optimizer.param_groups[0]['lr']
 
     # 训练循环（使用 tqdm 显示进度）
@@ -35,8 +32,7 @@ def train_one_epoch(model, data_loader, optimizer, scaler, use_amp, cuda,
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast('cuda', enabled=use_amp):
             pred = model(burst_noise)
-            loss = charbonnier_loss(pred, gt)
-            #loss = safnet_loss(pred, gt)
+            loss = loss_fn(pred, gt)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()

@@ -1,16 +1,18 @@
 """
-SAFNet_Claude_6 — Large Kernel DW-Conv (ConvNeXt Style)
-=======================================================
-Core innovation: Replace DW 3x3 with DW 7x7 in HybridBlock to enlarge
-receptive field without dilation. 7x7 depthwise conv already provides
-sufficient spatial coverage, making multi-scale dilation unnecessary.
+SAFNet_Claude_8 — Hybrid Conv + Multi-head Transposed Attention (MDTA)
+======================================================================
+Core innovation: Replace last 2 HybridBlocks with multi-head transposed
+attention blocks. Transposed attention operates on CxC (channel-channel)
+instead of (HW)x(HW), giving O(C^2*HW) complexity — controllable for 72ch.
 
-Reference: ConvNeXt (CVPR 2022), RepLKNet (CVPR 2022)
+First 6 blocks: HybridBlock (DW-Sep + SE) for local feature extraction
+Last 2 blocks: MDTABlock for global channel interaction
+
+Reference: Restormer (CVPR 2022), ART (ICCV 2023)
 
 Changes from Claude_5:
-  - HybridBlock DW kernel: 3x3 -> 7x7, padding=3
-  - Dilation removed (all dilation=1)
-  - 8 blocks, 72ch (unchanged)
+  - Last 2 of 8 blocks replaced with MDTABlock
+  - 72ch, 8 blocks total (6 HybridBlock + 2 MDTABlock)
 """
 import numpy as np
 import torch
@@ -127,21 +129,17 @@ class DeformConvRelu(nn.Module):
         return self.prelu(self.deform(x, offset))
 
 
-# ======================== LargeKernelBlock ========================
-class LargeKernelBlock(nn.Module):
-    """
-    ConvNeXt-style block: inverted bottleneck with 7x7 depthwise conv + SE.
-    The large kernel provides wide receptive field without needing dilation.
-    """
-    def __init__(self, channels, se_reduction=4, expand_ratio=2):
+# ======================== HybridBlock ========================
+class HybridBlock(nn.Module):
+    """Inverted bottleneck with DW-Sep conv + SE (same as Claude_5)."""
+    def __init__(self, channels, dilation=1, se_reduction=4, expand_ratio=2):
         super().__init__()
         expand_ch = channels * expand_ratio
         se_ch = max(expand_ch // se_reduction, 8)
 
         self.norm = nn.GroupNorm(1, channels)
         self.pw1 = nn.Conv2d(channels, expand_ch, 1, bias=True)
-        # 7x7 depthwise conv (no dilation needed)
-        self.dw = nn.Conv2d(expand_ch, expand_ch, 7, 1, 3,
+        self.dw = nn.Conv2d(expand_ch, expand_ch, 3, 1, dilation, dilation,
                             groups=expand_ch, bias=True)
         self.act = nn.GELU()
         self.se = nn.Sequential(
@@ -162,6 +160,69 @@ class LargeKernelBlock(nn.Module):
         y = y * self.se(y)
         y = self.pw2(y)
         return x + y * self.scale
+
+
+# ======================== MDTABlock ========================
+class MDTABlock(nn.Module):
+    """
+    Multi-head Transposed Attention block (Restormer style).
+    Attention on C×C matrix instead of (HW)×(HW) — O(C²HW) complexity.
+    For 72ch this is very efficient.
+    Includes a DW-conv FFN (feed-forward network) after attention.
+    """
+    def __init__(self, channels, num_heads=4, ffn_expand=2):
+        super().__init__()
+        self.num_heads = num_heads
+
+        # Transposed Attention
+        self.norm1 = nn.GroupNorm(1, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=True)
+        self.proj = nn.Conv2d(channels, channels, 1, bias=True)
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+
+        # FFN with DW conv
+        self.norm2 = nn.GroupNorm(1, channels)
+        ffn_ch = channels * ffn_expand
+        self.ffn_pw1 = nn.Conv2d(channels, ffn_ch, 1, bias=True)
+        self.ffn_dw = nn.Conv2d(ffn_ch, ffn_ch, 3, 1, 1,
+                                groups=ffn_ch, bias=True)
+        self.ffn_act = nn.GELU()
+        self.ffn_pw2 = nn.Conv2d(ffn_ch, channels, 1, bias=True)
+
+        self.attn_scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
+        self.ffn_scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # Multi-head Transposed Attention
+        y = self.norm1(x)
+        qkv = self.qkv(y)
+        q, k, v = qkv.chunk(3, dim=1)
+
+        q = q.reshape(B, self.num_heads, C // self.num_heads, H * W)
+        k = k.reshape(B, self.num_heads, C // self.num_heads, H * W)
+        v = v.reshape(B, self.num_heads, C // self.num_heads, H * W)
+
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+
+        # Transposed attention: (C/h × HW) @ (HW × C/h) = C/h × C/h
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).reshape(B, C, H, W)
+        out = self.proj(out)
+        x = x + out * self.attn_scale
+
+        # FFN
+        y = self.norm2(x)
+        y = self.ffn_pw1(y)
+        y = self.ffn_dw(y)
+        y = self.ffn_act(y)
+        y = self.ffn_pw2(y)
+        x = x + y * self.ffn_scale
+
+        return x
 
 
 # ======================== Encoder ========================
@@ -230,10 +291,16 @@ class RefineNet(nn.Module):
             convrelu(c1, c1))
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), convrelu(c2, c2))
 
-        # 8 LargeKernelBlocks — all dilation=1 (7x7 provides sufficient RF)
-        self.blocks = nn.Sequential(*[
-            LargeKernelBlock(total_c) for _ in range(8)
+        # First 6 blocks: HybridBlock with dilation
+        dilations = [1, 1, 2, 4, 4, 2]
+        self.conv_blocks = nn.Sequential(*[
+            HybridBlock(total_c, dilation=d) for d in dilations
         ])
+        # Last 2 blocks: MDTABlock (transposed attention)
+        self.attn_blocks = nn.Sequential(
+            MDTABlock(total_c, num_heads=4),
+            MDTABlock(total_c, num_heads=4),
+        )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
         self.pixel_shuffle = nn.PixelShuffle(2)
@@ -249,7 +316,8 @@ class RefineNet(nn.Module):
         feat2_warp = warp(feat2, flow2)
         feat = torch.cat([feat0_warp, feat1, feat2_warp], 1)
 
-        feat = self.blocks(feat)
+        feat = self.conv_blocks(feat)
+        feat = self.attn_blocks(feat)
 
         res = self.pixel_shuffle(self.conv3(feat))
         img_hdr_m_up = F.interpolate(img_hdr_m, scale_factor=2,
@@ -257,8 +325,8 @@ class RefineNet(nn.Module):
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
 
-# ======================== SAFNet_Claude_6 ========================
-class SAFNet_Claude_6(nn.Module):
+# ======================== SAFNet_Claude_8 ========================
+class SAFNet_Claude_8(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
@@ -344,7 +412,7 @@ class SAFNet_Claude_6(nn.Module):
 
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = SAFNet_Claude_6().to(device)
+    model = SAFNet_Claude_8().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
     from ptflops import get_model_complexity_info
