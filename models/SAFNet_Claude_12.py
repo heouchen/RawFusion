@@ -1,19 +1,13 @@
 """
-SAFNet_Claude_9 — FFT-Enhanced Block
-=====================================
-Core innovation: Add a parallel frequency-domain branch inside HybridBlock.
-After DW conv + GELU, an FFT branch processes features in spectral domain
-via per-channel complex-valued 2x2 transform, then fuses with the spatial
-branch through learnable weights. Captures global frequency patterns that
-local convolutions miss.
-
-Reference: FocalNet (NeurIPS 2022), FFTformer (ICML 2023)
-
-Changes from Claude_5:
-  - FFT branch added after DW conv, before SE
-  - Per-channel complex spectral filter (grouped 1x1 conv on real+imag)
-  - Learnable spatial/frequency fusion weights
-  - 7 blocks (reduced from 8), 72ch
+SAFNet_Claude_12 — Iterative Flow Refinement (2-Pass Flow Estimation)
+=====================================================================
+Based on Claude_5, keeps RefineNet identical.
+Innovation: RAFT-inspired 2-pass coarse-to-fine flow estimation.
+  Pass 1: Standard encode→decode → coarse flow
+  Pass 2: Warp sources with coarse flow, re-encode, decode → residual flow
+  Final:  flow = flow_pass1 + flow_residual
+No new parameters (reuses existing Encoder + Decoder).
+Estimated: 0.830M params, ~87.8G MACs
 """
 import numpy as np
 import torch
@@ -130,17 +124,8 @@ class DeformConvRelu(nn.Module):
         return self.prelu(self.deform(x, offset))
 
 
-# ======================== FFTBlock ========================
-class FFTBlock(nn.Module):
-    """
-    HybridBlock with parallel FFT branch for global frequency processing.
-    After DW conv + GELU, features are processed in both spatial and
-    frequency domains, then fused with learnable weights before SE.
-
-    FFT branch: rfft2 -> per-channel complex transform (grouped 1x1 conv
-    on stacked real+imag, groups=expand_ch for 2x2 complex mixing per
-    channel) -> irfft2 -> weighted fusion with spatial branch.
-    """
+# ======================== HybridBlock ========================
+class HybridBlock(nn.Module):
     def __init__(self, channels, dilation=1, se_reduction=4, expand_ratio=2):
         super().__init__()
         expand_ch = channels * expand_ratio
@@ -151,15 +136,6 @@ class FFTBlock(nn.Module):
         self.dw = nn.Conv2d(expand_ch, expand_ch, 3, 1, dilation, dilation,
                             groups=expand_ch, bias=True)
         self.act = nn.GELU()
-
-        # FFT branch: per-channel complex-valued 2x2 transform
-        # Groups=expand_ch means each group has 2 in (real,imag) -> 2 out
-        self.fft_conv = nn.Conv2d(expand_ch * 2, expand_ch * 2, 1,
-                                  groups=expand_ch, bias=True)
-        # Learnable fusion weights (spatial vs frequency)
-        self.spatial_weight = nn.Parameter(torch.ones(1) * 0.9)
-        self.fft_weight = nn.Parameter(torch.ones(1) * 0.1)
-
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(expand_ch, se_ch, 1, bias=True),
@@ -175,25 +151,6 @@ class FFTBlock(nn.Module):
         y = self.pw1(y)
         y = self.dw(y)
         y = self.act(y)
-
-        # FFT branch
-        _, _, H, W = y.shape
-        # Run FFT path in FP32 for AMP stability: cuFFT half precision only
-        # supports power-of-two sizes, while training crops include 192x384.
-        with torch.amp.autocast(device_type=y.device.type, enabled=False):
-            y_fft = y.float()
-            fft_y = torch.fft.rfft2(y_fft, norm='ortho')
-            # Stack real and imag as interleaved channels for grouped conv
-            fft_features = torch.cat([fft_y.real, fft_y.imag], dim=1)
-            fft_features = self.fft_conv(fft_features)
-            fft_real, fft_imag = fft_features.chunk(2, dim=1)
-            fft_out = torch.fft.irfft2(
-                torch.complex(fft_real, fft_imag), s=(H, W), norm='ortho')
-        fft_out = fft_out.to(dtype=y.dtype)
-
-        # Weighted fusion of spatial and frequency branches
-        y = self.spatial_weight * y + self.fft_weight * fft_out
-
         y = y * self.se(y)
         y = self.pw2(y)
         return x + y * self.scale
@@ -257,7 +214,7 @@ class RefineNet(nn.Module):
     def __init__(self, img_channels=4):
         super().__init__()
         c0, c1, c2 = 18, 36, 18
-        total_c = c0 + c1 + c2  # 72
+        total_c = c0 + c1 + c2
 
         self.conv0 = nn.Sequential(convrelu(img_channels, c0), convrelu(c0, c0))
         self.conv1 = nn.Sequential(
@@ -265,11 +222,16 @@ class RefineNet(nn.Module):
             convrelu(c1, c1))
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), convrelu(c2, c2))
 
-        # 7 FFTBlocks with symmetric dilation
-        dilations = [1, 1, 2, 4, 2, 1, 1]
-        self.blocks = nn.Sequential(*[
-            FFTBlock(total_c, dilation=d) for d in dilations
-        ])
+        self.blocks = nn.Sequential(
+            HybridBlock(total_c, dilation=1),
+            HybridBlock(total_c, dilation=1),
+            HybridBlock(total_c, dilation=2),
+            HybridBlock(total_c, dilation=4),
+            HybridBlock(total_c, dilation=4),
+            HybridBlock(total_c, dilation=2),
+            HybridBlock(total_c, dilation=1),
+            HybridBlock(total_c, dilation=1),
+        )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
         self.pixel_shuffle = nn.PixelShuffle(2)
@@ -293,8 +255,8 @@ class RefineNet(nn.Module):
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
 
-# ======================== SAFNet_Claude_9 ========================
-class SAFNet_Claude_9(nn.Module):
+# ======================== SAFNet_Claude_12 ========================
+class SAFNet_Claude_12(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
@@ -313,10 +275,12 @@ class SAFNet_Claude_9(nn.Module):
             img1_c = F.interpolate(img1_c, size=input_size, mode='bilinear', align_corners=False)
             img2_c = F.interpolate(img2_c, size=input_size, mode='bilinear', align_corners=False)
 
+        # === Pass 1: Encode all 3 frames ===
         f0_1, f0_2, f0_3, f0_4 = self.encoder(img0_c)
-        f1_1, f1_2, f1_3, f1_4 = self.encoder(img1_c)
+        f1_1, f1_2, f1_3, f1_4 = self.encoder(img1_c)  # cached for pass 2
         f2_1, f2_2, f2_3, f2_4 = self.encoder(img2_c)
 
+        # Pass 1: Decode 4 levels from zero
         up_flow0_5 = torch.zeros_like(f1_4[:, 0:2])
         up_flow2_5 = torch.zeros_like(f1_4[:, 0:2])
         up_mask0_5 = torch.zeros_like(f1_4[:, 0:1])
@@ -331,19 +295,46 @@ class SAFNet_Claude_9(nn.Module):
         up_flow0_1, up_flow2_1, up_mask0_1, up_mask2_1 = self.decoder(
             f0_1, f1_1, f2_1, up_flow0_2, up_flow2_2, up_mask0_2, up_mask2_2)
 
+        # === Pass 2: Warp sources with coarse flow, re-encode, decode residual ===
+        img0_warp_p2 = warp(img0_c, up_flow0_1)
+        img2_warp_p2 = warp(img2_c, up_flow2_1)
+
+        f0w_1, f0w_2, f0w_3, f0w_4 = self.encoder(img0_warp_p2)
+        f2w_1, f2w_2, f2w_3, f2w_4 = self.encoder(img2_warp_p2)
+        # f1 features reused from pass 1
+
+        # Pass 2: Decode 4 levels from zero (residual flow near zero)
+        up_rflow0_5 = torch.zeros_like(f1_4[:, 0:2])
+        up_rflow2_5 = torch.zeros_like(f1_4[:, 0:2])
+        up_rmask0_5 = torch.zeros_like(f1_4[:, 0:1])
+        up_rmask2_5 = torch.zeros_like(f1_4[:, 0:1])
+
+        up_rflow0_4, up_rflow2_4, up_rmask0_4, up_rmask2_4 = self.decoder(
+            f0w_4, f1_4, f2w_4, up_rflow0_5, up_rflow2_5, up_rmask0_5, up_rmask2_5)
+        up_rflow0_3, up_rflow2_3, up_rmask0_3, up_rmask2_3 = self.decoder(
+            f0w_3, f1_3, f2w_3, up_rflow0_4, up_rflow2_4, up_rmask0_4, up_rmask2_4)
+        up_rflow0_2, up_rflow2_2, up_rmask0_2, up_rmask2_2 = self.decoder(
+            f0w_2, f1_2, f2w_2, up_rflow0_3, up_rflow2_3, up_rmask0_3, up_rmask2_3)
+        up_rflow0_1, up_rflow2_1, up_rmask0_1, up_rmask2_1 = self.decoder(
+            f0w_1, f1_1, f2w_1, up_rflow0_2, up_rflow2_2, up_rmask0_2, up_rmask2_2)
+
+        # Combine: final flow = pass1 + residual, mask from pass 2
+        final_flow0 = up_flow0_1 + up_rflow0_1
+        final_flow2 = up_flow2_1 + up_rflow2_1
+
         if input_size != org_size:
             scale_h = org_size[0] / input_size[0]
             scale_w = org_size[1] / input_size[1]
-            up_flow0_1 = F.interpolate(up_flow0_1, size=org_size, mode='bilinear', align_corners=False)
-            up_flow0_1[:, 0, :, :] *= scale_w
-            up_flow0_1[:, 1, :, :] *= scale_h
-            up_flow2_1 = F.interpolate(up_flow2_1, size=org_size, mode='bilinear', align_corners=False)
-            up_flow2_1[:, 0, :, :] *= scale_w
-            up_flow2_1[:, 1, :, :] *= scale_h
-            up_mask0_1 = F.interpolate(up_mask0_1, size=org_size, mode='bilinear', align_corners=False)
-            up_mask2_1 = F.interpolate(up_mask2_1, size=org_size, mode='bilinear', align_corners=False)
+            final_flow0 = F.interpolate(final_flow0, size=org_size, mode='bilinear', align_corners=False)
+            final_flow0[:, 0, :, :] *= scale_w
+            final_flow0[:, 1, :, :] *= scale_h
+            final_flow2 = F.interpolate(final_flow2, size=org_size, mode='bilinear', align_corners=False)
+            final_flow2[:, 0, :, :] *= scale_w
+            final_flow2[:, 1, :, :] *= scale_h
+            up_rmask0_1 = F.interpolate(up_rmask0_1, size=org_size, mode='bilinear', align_corners=False)
+            up_rmask2_1 = F.interpolate(up_rmask2_1, size=org_size, mode='bilinear', align_corners=False)
 
-        return torch.sigmoid(up_mask0_1), torch.sigmoid(up_mask2_1), up_flow0_1, up_flow2_1
+        return torch.sigmoid(up_rmask0_1), torch.sigmoid(up_rmask2_1), final_flow0, final_flow2
 
     def forward(self, x, scale_factor=0.5, refine=True):
         img0_c = x[:, 0:4, :, :]
@@ -379,16 +370,11 @@ class SAFNet_Claude_9(nn.Module):
 
 
 if __name__ == "__main__":
-    model = SAFNet_Claude_9()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = SAFNet_Claude_12().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
     from ptflops import get_model_complexity_info
-    try:
-        # Use CPU for FLOPs estimation to avoid CUDA OOM when GPU is busy.
-        model_cpu = model.cpu().eval()
-        with torch.no_grad():
-            macs, params = get_model_complexity_info(
-                model_cpu, (36, 384, 768), verbose=False, print_per_layer_stat=True)
-        print(f"MACs: {macs}, Params: {params}")
-    except Exception as e:
-        print(f"FLOPs estimation failed: {e}")
+    macs, params = get_model_complexity_info(
+        model, (36, 384, 768), verbose=False, print_per_layer_stat=True)
+    print(f"MACs: {macs}, Params: {params}")

@@ -7,10 +7,12 @@ Features:
   - Saves validation outputs as 96-bit TIF (float32 x 3ch) for NTIRE submission
   - Reports per-scene and average PSNR / SSIM
   - Creates img/ folder under the checkpoint dir for output images
+  - Optional TTA (Test-Time Augmentation): 8-fold D4 geometric ensemble
 
 Usage:
   python eval.py --model safnet_claude_5 --exp_name model_cmp_claude5
   python eval.py --model safnet_claude_6 --exp_name model_cmp_claude6 --save_gt
+  python eval.py --model safnet_claude_5 --exp_name model_cmp_claude5 --tta
 """
 
 import torch
@@ -22,12 +24,44 @@ import os
 import time
 import argparse
 import glob
+import zipfile
 
 from torchvision.transforms import transforms
 from DataLoader.custom_data_class import CustomDataset
 from models import build_model, MODEL_NAMES
 from utils.utils import calculate_psnr, calculate_ssim
 from utils.checkpoint import load_checkpoint, load_model_state_dict
+
+
+def tta_forward(model, x):
+    """8-fold TTA using D4 dihedral group (4 rotations x 2 flips).
+
+    For each of the 8 geometric transforms:
+      1. Apply transform to input
+      2. Run model inference
+      3. Apply inverse transform to output
+    Returns the average of all 8 predictions.
+    """
+    preds = []
+    for flip in (False, True):
+        for rot_k in range(4):
+            x_aug = x
+            if flip:
+                x_aug = torch.flip(x_aug, dims=[-1])
+            if rot_k:
+                x_aug = torch.rot90(x_aug, k=rot_k, dims=[-2, -1])
+
+            pred = model(x_aug)
+
+            # Inverse: undo rotation first, then undo flip
+            if rot_k:
+                pred = torch.rot90(pred, k=(4 - rot_k), dims=[-2, -1])
+            if flip:
+                pred = torch.flip(pred, dims=[-1])
+
+            preds.append(pred)
+
+    return sum(preds) / len(preds)
 
 
 def find_best_checkpoint(checkpoint_dir):
@@ -57,6 +91,7 @@ def eval_model(
     mgpu=True,
     save_gt=False,
     save_input=False,
+    tta=False,
 ):
     """Evaluate a model on the validation set and save output TIF images.
 
@@ -69,8 +104,12 @@ def eval_model(
         mgpu: Use DataParallel
         save_gt: Also save GT images alongside predictions
         save_input: Also save per-frame input images
+        tta: Enable 8-fold D4 test-time augmentation
     """
-    print(f'=== Evaluation: {model_name} (exp: {exp_name}) ===\n')
+    print(f'=== Evaluation: {model_name} (exp: {exp_name}) ===')
+    if tta:
+        print(f'    TTA: enabled (8-fold D4 geometric ensemble)')
+    print()
 
     # ---- Resolve checkpoint directory ----
     checkpoint_dir = os.path.join(
@@ -145,7 +184,7 @@ def eval_model(
             b, f, c, h, w = burst_noise.shape
             burst_noise = burst_noise.view(b, f * c, h, w)
 
-            pred = model(burst_noise)
+            pred = tta_forward(model, burst_noise) if tta else model(burst_noise)
             pred = torch.clamp(pred, 0.0, 1.0)
 
             t1 = time.time()
@@ -162,18 +201,16 @@ def eval_model(
                   f'SSIM: {ssim_val:.4f} | time: {elapsed:.2f}s')
 
             # ---- Save output as 96-bit TIF (float32 x 3ch) ----
-            # pred: (1, 3, H, W) -> (H, W, 3) float32, BGR for cv2
+            # Data pipeline: cv2.imread(BGR) -> ToTensor(BGR CHW) -> model(BGR CHW)
+            # So pred is BGR, which is exactly what cv2.imwrite expects.
             pred_np = pred[0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
-            # Model outputs RGB, cv2.imwrite expects BGR
-            pred_bgr = pred_np[:, :, ::-1]
             out_path = os.path.join(img_dir, f'Scene-{scene_id:03d}-out.tif')
-            cv2.imwrite(out_path, pred_bgr)
+            cv2.imwrite(out_path, pred_np)
 
             if save_gt:
                 gt_np = gt[0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
-                gt_bgr = gt_np[:, :, ::-1]
                 gt_path = os.path.join(img_dir, f'Scene-{scene_id:03d}-gt.tif')
-                cv2.imwrite(gt_path, gt_bgr)
+                cv2.imwrite(gt_path, gt_np)
 
             if save_input:
                 burst_cpu = burst_noise[0].cpu()  # (36, H, W)
@@ -210,6 +247,19 @@ def eval_model(
             f'ERROR: expected 3-channel, got shape {verify.shape}'
         print('=> Format OK: 96-bit depth (32bit x 3ch) float32 TIF')
 
+    # ---- Pack all images into result.zip ----
+    zip_path = os.path.join(checkpoint_dir, 'result.zip')
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
+        for fname in sorted(os.listdir(img_dir)):
+            fpath = os.path.join(img_dir, fname)
+            if os.path.isfile(fpath):
+                zf.write(fpath, fname)  # arcname=fname: flat structure in zip
+    print(f'=> Packed {len(zf.namelist()) if False else "all"} images into: {zip_path}')
+    # Print actual count
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        print(f'   {len(zf.namelist())} files in zip, '
+              f'size: {os.path.getsize(zip_path) / 1e6:.1f} MB')
+
     return avg_psnr, avg_ssim
 
 
@@ -232,6 +282,8 @@ if __name__ == '__main__':
                         help='Also save GT images')
     parser.add_argument('--save_input', action='store_true',
                         help='Also save input frame images')
+    parser.add_argument('--tta', action='store_true',
+                        help='Enable 8-fold D4 test-time augmentation (flip+rot90)')
     args = parser.parse_args()
 
     eval_model(
@@ -243,4 +295,5 @@ if __name__ == '__main__':
         mgpu=bool(args.mgpu),
         save_gt=args.save_gt,
         save_input=args.save_input,
+        tta=args.tta,
     )

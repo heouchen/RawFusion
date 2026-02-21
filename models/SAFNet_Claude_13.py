@@ -1,19 +1,13 @@
 """
-SAFNet_Claude_9 — FFT-Enhanced Block
-=====================================
-Core innovation: Add a parallel frequency-domain branch inside HybridBlock.
-After DW conv + GELU, an FFT branch processes features in spectral domain
-via per-channel complex-valued 2x2 transform, then fuses with the spatial
-branch through learnable weights. Captures global frequency patterns that
-local convolutions miss.
-
-Reference: FocalNet (NeurIPS 2022), FFTformer (ICML 2023)
-
-Changes from Claude_5:
-  - FFT branch added after DW conv, before SE
-  - Per-channel complex spectral filter (grouped 1x1 conv on real+imag)
-  - Learnable spatial/frequency fusion weights
-  - 7 blocks (reduced from 8), 72ch
+SAFNet_Claude_13 — Flow-Guided Deformable Alignment (DCN Warp)
+==============================================================
+Based on Claude_5, keeps RefineNet identical.
+Innovation: Replace bilinear warp in Decoder with Flow-Guided DCN.
+  - flow_to_dcn_offset: converts optical flow to DCN base offsets
+  - FlowGuidedDCN: learns residual offsets on top of flow-based base offsets
+  - DecoderDCN: uses FlowGuidedDCN instead of bilinear warp
+Ref: EDVR PCD Alignment (CVPRW 2019), BasicVSR++ (CVPR 2022)
+Estimated: ~0.866M params (+36K), ~78.1G MACs (+1.8G)
 """
 import numpy as np
 import torch
@@ -130,17 +124,8 @@ class DeformConvRelu(nn.Module):
         return self.prelu(self.deform(x, offset))
 
 
-# ======================== FFTBlock ========================
-class FFTBlock(nn.Module):
-    """
-    HybridBlock with parallel FFT branch for global frequency processing.
-    After DW conv + GELU, features are processed in both spatial and
-    frequency domains, then fused with learnable weights before SE.
-
-    FFT branch: rfft2 -> per-channel complex transform (grouped 1x1 conv
-    on stacked real+imag, groups=expand_ch for 2x2 complex mixing per
-    channel) -> irfft2 -> weighted fusion with spatial branch.
-    """
+# ======================== HybridBlock ========================
+class HybridBlock(nn.Module):
     def __init__(self, channels, dilation=1, se_reduction=4, expand_ratio=2):
         super().__init__()
         expand_ch = channels * expand_ratio
@@ -151,15 +136,6 @@ class FFTBlock(nn.Module):
         self.dw = nn.Conv2d(expand_ch, expand_ch, 3, 1, dilation, dilation,
                             groups=expand_ch, bias=True)
         self.act = nn.GELU()
-
-        # FFT branch: per-channel complex-valued 2x2 transform
-        # Groups=expand_ch means each group has 2 in (real,imag) -> 2 out
-        self.fft_conv = nn.Conv2d(expand_ch * 2, expand_ch * 2, 1,
-                                  groups=expand_ch, bias=True)
-        # Learnable fusion weights (spatial vs frequency)
-        self.spatial_weight = nn.Parameter(torch.ones(1) * 0.9)
-        self.fft_weight = nn.Parameter(torch.ones(1) * 0.1)
-
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(expand_ch, se_ch, 1, bias=True),
@@ -175,25 +151,6 @@ class FFTBlock(nn.Module):
         y = self.pw1(y)
         y = self.dw(y)
         y = self.act(y)
-
-        # FFT branch
-        _, _, H, W = y.shape
-        # Run FFT path in FP32 for AMP stability: cuFFT half precision only
-        # supports power-of-two sizes, while training crops include 192x384.
-        with torch.amp.autocast(device_type=y.device.type, enabled=False):
-            y_fft = y.float()
-            fft_y = torch.fft.rfft2(y_fft, norm='ortho')
-            # Stack real and imag as interleaved channels for grouped conv
-            fft_features = torch.cat([fft_y.real, fft_y.imag], dim=1)
-            fft_features = self.fft_conv(fft_features)
-            fft_real, fft_imag = fft_features.chunk(2, dim=1)
-            fft_out = torch.fft.irfft2(
-                torch.complex(fft_real, fft_imag), s=(H, W), norm='ortho')
-        fft_out = fft_out.to(dtype=y.dtype)
-
-        # Weighted fusion of spatial and frequency branches
-        y = self.spatial_weight * y + self.fft_weight * fft_out
-
         y = y * self.se(y)
         y = self.pw2(y)
         return x + y * self.scale
@@ -224,10 +181,43 @@ class Encoder(nn.Module):
         return f1, f2, f3, f4
 
 
-# ======================== Decoder ========================
-class Decoder(nn.Module):
+# ======================== Flow-Guided DCN ========================
+def flow_to_dcn_offset(flow, kernel_size=3):
+    """Convert optical flow to DCN base offset.
+
+    flow: (B, 2, H, W) where flow[:,0]=dx, flow[:,1]=dy
+    Returns: (B, 2*K*K, H, W) with interleaved (dy, dx) per kernel position
+    """
+    flow_yx = torch.cat([flow[:, 1:2], flow[:, 0:1]], dim=1)  # swap to (dy, dx)
+    return flow_yx.repeat(1, kernel_size * kernel_size, 1, 1)
+
+
+class FlowGuidedDCN(nn.Module):
+    """Flow-guided deformable alignment: uses flow as base offset + learns residual."""
+    def __init__(self, channels=40, kernel_size=3):
+        super().__init__()
+        self.kernel_size = kernel_size
+        offset_channels = 2 * kernel_size * kernel_size  # 18 for 3x3
+        self.offset_conv = nn.Sequential(
+            nn.Conv2d(channels + 2, channels, 3, 1, 1),
+            nn.PReLU(channels),
+            nn.Conv2d(channels, offset_channels, 3, 1, 1),
+        )
+        self.dcn = DeformConv2d(channels, channels, kernel_size, 1,
+                                kernel_size // 2)
+
+    def forward(self, feat, flow):
+        base_offset = flow_to_dcn_offset(flow, self.kernel_size)
+        residual = self.offset_conv(torch.cat([feat, flow], dim=1))
+        return self.dcn(feat, base_offset + residual)
+
+
+# ======================== DecoderDCN ========================
+class DecoderDCN(nn.Module):
+    """Decoder with Flow-Guided DCN replacing bilinear warp."""
     def __init__(self):
         super().__init__()
+        self.fgdcn = FlowGuidedDCN(40)
         self.conv1 = DeformConvRelu(126, 120)
         self.conv2 = convrelu(120, 120, groups=3)
         self.conv3 = convrelu(120, 120, groups=3)
@@ -236,8 +226,8 @@ class Decoder(nn.Module):
         self.conv6 = deconv(120, 6)
 
     def forward(self, f0, f1, f2, flow0, flow2, mask0, mask2):
-        f0_warp = warp(f0, flow0)
-        f2_warp = warp(f2, flow2)
+        f0_warp = self.fgdcn(f0, flow0)
+        f2_warp = self.fgdcn(f2, flow2)
         f_in = torch.cat([f0_warp, f1, f2_warp, flow0, flow2, mask0, mask2], 1)
         f_out = self.conv1(f_in)
         f_out = channel_shuffle(self.conv2(f_out), 3)
@@ -257,7 +247,7 @@ class RefineNet(nn.Module):
     def __init__(self, img_channels=4):
         super().__init__()
         c0, c1, c2 = 18, 36, 18
-        total_c = c0 + c1 + c2  # 72
+        total_c = c0 + c1 + c2
 
         self.conv0 = nn.Sequential(convrelu(img_channels, c0), convrelu(c0, c0))
         self.conv1 = nn.Sequential(
@@ -265,11 +255,16 @@ class RefineNet(nn.Module):
             convrelu(c1, c1))
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), convrelu(c2, c2))
 
-        # 7 FFTBlocks with symmetric dilation
-        dilations = [1, 1, 2, 4, 2, 1, 1]
-        self.blocks = nn.Sequential(*[
-            FFTBlock(total_c, dilation=d) for d in dilations
-        ])
+        self.blocks = nn.Sequential(
+            HybridBlock(total_c, dilation=1),
+            HybridBlock(total_c, dilation=1),
+            HybridBlock(total_c, dilation=2),
+            HybridBlock(total_c, dilation=4),
+            HybridBlock(total_c, dilation=4),
+            HybridBlock(total_c, dilation=2),
+            HybridBlock(total_c, dilation=1),
+            HybridBlock(total_c, dilation=1),
+        )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
         self.pixel_shuffle = nn.PixelShuffle(2)
@@ -293,12 +288,12 @@ class RefineNet(nn.Module):
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
 
-# ======================== SAFNet_Claude_9 ========================
-class SAFNet_Claude_9(nn.Module):
+# ======================== SAFNet_Claude_13 ========================
+class SAFNet_Claude_13(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
-        self.decoder = Decoder()
+        self.decoder = DecoderDCN()
         self.refinenet = RefineNet()
 
     def forward_flow_mask(self, img0_c, img1_c, img2_c, scale_factor=0.5):
@@ -379,16 +374,11 @@ class SAFNet_Claude_9(nn.Module):
 
 
 if __name__ == "__main__":
-    model = SAFNet_Claude_9()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = SAFNet_Claude_13().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
     from ptflops import get_model_complexity_info
-    try:
-        # Use CPU for FLOPs estimation to avoid CUDA OOM when GPU is busy.
-        model_cpu = model.cpu().eval()
-        with torch.no_grad():
-            macs, params = get_model_complexity_info(
-                model_cpu, (36, 384, 768), verbose=False, print_per_layer_stat=True)
-        print(f"MACs: {macs}, Params: {params}")
-    except Exception as e:
-        print(f"FLOPs estimation failed: {e}")
+    macs, params = get_model_complexity_info(
+        model, (36, 384, 768), verbose=False, print_per_layer_stat=True)
+    print(f"MACs: {macs}, Params: {params}")

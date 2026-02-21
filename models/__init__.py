@@ -11,6 +11,11 @@ from models.SAFNet_Claude_7 import SAFNet_Claude_7
 from models.SAFNet_Claude_8 import SAFNet_Claude_8
 from models.SAFNet_Claude_9 import SAFNet_Claude_9
 from models.SAFNet_Claude_10 import SAFNet_Claude_10
+from models.SAFNet_Claude_11 import SAFNet_Claude_11
+from models.SAFNet_Claude_12 import SAFNet_Claude_12
+from models.SAFNet_Claude_13 import SAFNet_Claude_13
+from models.SAFNet_Claude_14 import SAFNet_Claude_14
+from models.SAFNet_Claude_15 import SAFNet_Claude_15
 from models.SAFNet_Claude_5_pconv import SAFNet_Claude_5_pconv
 
 _MODEL_MAP = {
@@ -27,6 +32,11 @@ _MODEL_MAP = {
     'safnet_claude_8': SAFNet_Claude_8,
     'safnet_claude_9': SAFNet_Claude_9,
     'safnet_claude_10': SAFNet_Claude_10,
+    'safnet_claude_11': SAFNet_Claude_11,
+    'safnet_claude_12': SAFNet_Claude_12,
+    'safnet_claude_13': SAFNet_Claude_13,
+    'safnet_claude_14': SAFNet_Claude_14,
+    'safnet_claude_15': SAFNet_Claude_15,
     'safnet_claude_5_pconv': SAFNet_Claude_5_pconv,
 }
 

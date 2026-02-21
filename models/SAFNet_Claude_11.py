@@ -1,19 +1,19 @@
 """
-SAFNet_Claude_9 — FFT-Enhanced Block
-=====================================
-Core innovation: Add a parallel frequency-domain branch inside HybridBlock.
-After DW conv + GELU, an FFT branch processes features in spectral domain
-via per-channel complex-valued 2x2 transform, then fuses with the spatial
-branch through learnable weights. Captures global frequency patterns that
-local convolutions miss.
+SAFNet_Claude_11 — MDTA + DropPath + Dense Skip (Claude_8 × Claude_10)
+======================================================================
+Combines the two best-performing innovations:
+  From Claude_8:  Multi-head Transposed Attention (MDTA) for global context
+  From Claude_10: DropPath regularization + Dense skip connections + 80ch width
 
-Reference: FocalNet (NeurIPS 2022), FFTformer (ICML 2023)
+Architecture:
+  - Width: 80ch (20+40+20)
+  - Group 1: 3 HybridBlockDP [dilation 1,2,4] → dense fuse (concat + 1x1)
+  - Group 2: 2 HybridBlockDP [dilation 2,1] → sequential
+  - Tail:    2 MDTABlockDP (transposed attention + DropPath)
+  - Total: 5 conv + 2 MDTA = 7 blocks
+  - DropPath: linearly increasing 0 → 0.1 across all 7 blocks
 
-Changes from Claude_5:
-  - FFT branch added after DW conv, before SE
-  - Per-channel complex spectral filter (grouped 1x1 conv on real+imag)
-  - Learnable spatial/frequency fusion weights
-  - 7 blocks (reduced from 8), 72ch
+Encoder/Decoder: identical to Claude_5 (proven alignment)
 """
 import numpy as np
 import torch
@@ -130,18 +130,32 @@ class DeformConvRelu(nn.Module):
         return self.prelu(self.deform(x, offset))
 
 
-# ======================== FFTBlock ========================
-class FFTBlock(nn.Module):
-    """
-    HybridBlock with parallel FFT branch for global frequency processing.
-    After DW conv + GELU, features are processed in both spatial and
-    frequency domains, then fused with learnable weights before SE.
+# ======================== DropPath ========================
+def drop_path(x, drop_prob=0., training=False):
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+    if keep_prob > 0.:
+        random_tensor.div_(keep_prob)
+    return x * random_tensor
 
-    FFT branch: rfft2 -> per-channel complex transform (grouped 1x1 conv
-    on stacked real+imag, groups=expand_ch for 2x2 complex mixing per
-    channel) -> irfft2 -> weighted fusion with spatial branch.
-    """
-    def __init__(self, channels, dilation=1, se_reduction=4, expand_ratio=2):
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=0.):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
+
+# ======================== HybridBlockDP (from Claude_10) ========================
+class HybridBlockDP(nn.Module):
+    """DW-Sep inverted bottleneck + SE + DropPath."""
+    def __init__(self, channels, dilation=1, se_reduction=4,
+                 expand_ratio=2, drop_path_rate=0.):
         super().__init__()
         expand_ch = channels * expand_ratio
         se_ch = max(expand_ch // se_reduction, 8)
@@ -151,15 +165,6 @@ class FFTBlock(nn.Module):
         self.dw = nn.Conv2d(expand_ch, expand_ch, 3, 1, dilation, dilation,
                             groups=expand_ch, bias=True)
         self.act = nn.GELU()
-
-        # FFT branch: per-channel complex-valued 2x2 transform
-        # Groups=expand_ch means each group has 2 in (real,imag) -> 2 out
-        self.fft_conv = nn.Conv2d(expand_ch * 2, expand_ch * 2, 1,
-                                  groups=expand_ch, bias=True)
-        # Learnable fusion weights (spatial vs frequency)
-        self.spatial_weight = nn.Parameter(torch.ones(1) * 0.9)
-        self.fft_weight = nn.Parameter(torch.ones(1) * 0.1)
-
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(expand_ch, se_ch, 1, bias=True),
@@ -169,34 +174,77 @@ class FFTBlock(nn.Module):
         )
         self.pw2 = nn.Conv2d(expand_ch, channels, 1, bias=True)
         self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
 
     def forward(self, x):
         y = self.norm(x)
         y = self.pw1(y)
         y = self.dw(y)
         y = self.act(y)
-
-        # FFT branch
-        _, _, H, W = y.shape
-        # Run FFT path in FP32 for AMP stability: cuFFT half precision only
-        # supports power-of-two sizes, while training crops include 192x384.
-        with torch.amp.autocast(device_type=y.device.type, enabled=False):
-            y_fft = y.float()
-            fft_y = torch.fft.rfft2(y_fft, norm='ortho')
-            # Stack real and imag as interleaved channels for grouped conv
-            fft_features = torch.cat([fft_y.real, fft_y.imag], dim=1)
-            fft_features = self.fft_conv(fft_features)
-            fft_real, fft_imag = fft_features.chunk(2, dim=1)
-            fft_out = torch.fft.irfft2(
-                torch.complex(fft_real, fft_imag), s=(H, W), norm='ortho')
-        fft_out = fft_out.to(dtype=y.dtype)
-
-        # Weighted fusion of spatial and frequency branches
-        y = self.spatial_weight * y + self.fft_weight * fft_out
-
         y = y * self.se(y)
         y = self.pw2(y)
-        return x + y * self.scale
+        return x + self.drop_path(y * self.scale)
+
+
+# ======================== MDTABlockDP (from Claude_8 + DropPath) ========================
+class MDTABlockDP(nn.Module):
+    """
+    Multi-head Transposed Attention + DW-FFN + DropPath.
+    Transposed attention: O(C²HW) — efficient for moderate channel counts.
+    """
+    def __init__(self, channels, num_heads=4, ffn_expand=1, drop_path_rate=0.):
+        super().__init__()
+        self.num_heads = num_heads
+
+        # Transposed Attention
+        self.norm1 = nn.GroupNorm(1, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=True)
+        self.proj = nn.Conv2d(channels, channels, 1, bias=True)
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+
+        # FFN with DW conv
+        self.norm2 = nn.GroupNorm(1, channels)
+        ffn_ch = channels * ffn_expand
+        self.ffn_pw1 = nn.Conv2d(channels, ffn_ch, 1, bias=True)
+        self.ffn_dw = nn.Conv2d(ffn_ch, ffn_ch, 3, 1, 1,
+                                groups=ffn_ch, bias=True)
+        self.ffn_act = nn.GELU()
+        self.ffn_pw2 = nn.Conv2d(ffn_ch, channels, 1, bias=True)
+
+        self.attn_scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
+        self.ffn_scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # Multi-head Transposed Attention
+        y = self.norm1(x)
+        qkv = self.qkv(y)
+        q, k, v = qkv.chunk(3, dim=1)
+
+        q = q.reshape(B, self.num_heads, C // self.num_heads, H * W)
+        k = k.reshape(B, self.num_heads, C // self.num_heads, H * W)
+        v = v.reshape(B, self.num_heads, C // self.num_heads, H * W)
+
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).reshape(B, C, H, W)
+        out = self.proj(out)
+        x = x + self.drop_path(out * self.attn_scale)
+
+        # FFN
+        y = self.norm2(x)
+        y = self.ffn_pw1(y)
+        y = self.ffn_dw(y)
+        y = self.ffn_act(y)
+        y = self.ffn_pw2(y)
+        x = x + self.drop_path(y * self.ffn_scale)
+
+        return x
 
 
 # ======================== Encoder ========================
@@ -254,10 +302,19 @@ class Decoder(nn.Module):
 
 # ======================== RefineNet ========================
 class RefineNet(nn.Module):
+    """
+    Combines Claude_8 (MDTA) and Claude_10 (DropPath + Dense Skip) innovations.
+
+    80ch, 7 blocks total:
+      Group 1: 3 HybridBlockDP [d=1,2,4] → dense fuse (concat + 1x1 compress)
+      Group 2: 2 HybridBlockDP [d=2,1]   → sequential
+      Tail:    2 MDTABlockDP              → global context via transposed attention
+    DropPath with linearly increasing rate across all 7 blocks.
+    """
     def __init__(self, img_channels=4):
         super().__init__()
-        c0, c1, c2 = 18, 36, 18
-        total_c = c0 + c1 + c2  # 72
+        c0, c1, c2 = 20, 40, 20
+        total_c = c0 + c1 + c2  # 80
 
         self.conv0 = nn.Sequential(convrelu(img_channels, c0), convrelu(c0, c0))
         self.conv1 = nn.Sequential(
@@ -265,10 +322,27 @@ class RefineNet(nn.Module):
             convrelu(c1, c1))
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), convrelu(c2, c2))
 
-        # 7 FFTBlocks with symmetric dilation
-        dilations = [1, 1, 2, 4, 2, 1, 1]
-        self.blocks = nn.Sequential(*[
-            FFTBlock(total_c, dilation=d) for d in dilations
+        num_blocks = 7
+        dpr = [x.item() for x in torch.linspace(0, 0.1, num_blocks)]
+
+        # Group 1: 3 HybridBlockDP with dense skip
+        self.group1 = nn.ModuleList([
+            HybridBlockDP(total_c, dilation=1, drop_path_rate=dpr[0]),
+            HybridBlockDP(total_c, dilation=2, drop_path_rate=dpr[1]),
+            HybridBlockDP(total_c, dilation=4, drop_path_rate=dpr[2]),
+        ])
+        self.fuse1 = nn.Conv2d(total_c * 2, total_c, 1, bias=True)
+
+        # Group 2: 2 HybridBlockDP sequential
+        self.group2 = nn.ModuleList([
+            HybridBlockDP(total_c, dilation=2, drop_path_rate=dpr[3]),
+            HybridBlockDP(total_c, dilation=1, drop_path_rate=dpr[4]),
+        ])
+
+        # Tail: 2 MDTABlockDP for global context
+        self.attn_blocks = nn.ModuleList([
+            MDTABlockDP(total_c, num_heads=4, drop_path_rate=dpr[5]),
+            MDTABlockDP(total_c, num_heads=4, drop_path_rate=dpr[6]),
         ])
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
@@ -285,7 +359,19 @@ class RefineNet(nn.Module):
         feat2_warp = warp(feat2, flow2)
         feat = torch.cat([feat0_warp, feat1, feat2_warp], 1)
 
-        feat = self.blocks(feat)
+        # Group 1: local feature extraction with dense skip
+        group1_in = feat
+        for block in self.group1:
+            feat = block(feat)
+        feat = self.fuse1(torch.cat([group1_in, feat], 1))
+
+        # Group 2: multi-scale refinement
+        for block in self.group2:
+            feat = block(feat)
+
+        # Tail: global context via transposed attention
+        for block in self.attn_blocks:
+            feat = block(feat)
 
         res = self.pixel_shuffle(self.conv3(feat))
         img_hdr_m_up = F.interpolate(img_hdr_m, scale_factor=2,
@@ -293,8 +379,8 @@ class RefineNet(nn.Module):
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
 
-# ======================== SAFNet_Claude_9 ========================
-class SAFNet_Claude_9(nn.Module):
+# ======================== SAFNet_Claude_11 ========================
+class SAFNet_Claude_11(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
@@ -379,16 +465,11 @@ class SAFNet_Claude_9(nn.Module):
 
 
 if __name__ == "__main__":
-    model = SAFNet_Claude_9()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = SAFNet_Claude_11().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
     from ptflops import get_model_complexity_info
-    try:
-        # Use CPU for FLOPs estimation to avoid CUDA OOM when GPU is busy.
-        model_cpu = model.cpu().eval()
-        with torch.no_grad():
-            macs, params = get_model_complexity_info(
-                model_cpu, (36, 384, 768), verbose=False, print_per_layer_stat=True)
-        print(f"MACs: {macs}, Params: {params}")
-    except Exception as e:
-        print(f"FLOPs estimation failed: {e}")
+    macs, params = get_model_complexity_info(
+        model, (36, 384, 768), verbose=False, print_per_layer_stat=True)
+    print(f"MACs: {macs}, Params: {params}")

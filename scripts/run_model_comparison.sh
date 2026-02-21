@@ -24,7 +24,7 @@ TRAIN_ROOT="${TRAIN_ROOT:-/home/chen/data/ntire2026/hdr/train/}"
 VAL_ROOT="${VAL_ROOT:-/home/chen/data/ntire2026/hdr/validation/}"
 
 # Training Hyperparameters (所有实验保持一致)
-EPOCHS="${EPOCHS:-100}"
+EPOCHS="${EPOCHS:-300}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 LR="${LR:-2e-4}"
 LR_DECAY="${LR_DECAY:-0.95}"
@@ -80,10 +80,10 @@ run_one () {
 # ==============================================================================
 
 # 1. Claude_5 — 基线 (DW-Sep + SE, 72ch, 8 blocks)
-# run_one "safnet_claude_5" "model_cmp_claude5"
+run_one "safnet_claude_5" "model_cmp_claude5"
 
 # 2. Claude_6 — Large Kernel DW 7×7 (ConvNeXt style)
-# run_one "safnet_claude_6" "model_cmp_claude6"
+run_one "safnet_claude_6" "model_cmp_claude6"
 
 # 3. Claude_7 — SimpleGate + SCA (NAFNet style)
 run_one "safnet_claude_7" "model_cmp_claude7"
@@ -97,8 +97,23 @@ run_one "safnet_claude_9" "model_cmp_claude9"
 # 6. Claude_10 — Wider + DropPath + Dense Skip
 run_one "safnet_claude_10" "model_cmp_claude10"
 
+# 7. Claude_11 — MDTA + DropPath + Dense Skip (Claude_8 × Claude_10)
+run_one "safnet_claude_11" "model_cmp_claude11"
+
+# 8. Claude_12 — Iterative Flow Refinement (2-pass flow estimation)
+run_one "safnet_claude_12" "model_cmp_claude12"
+
+# 9. Claude_13 — Flow-Guided DCN Warp (deformable alignment)
+run_one "safnet_claude_13" "model_cmp_claude13"
+
+# 10. Claude_14 — Learned Attention HDR Merge
+run_one "safnet_claude_14" "model_cmp_claude14"
+
+# 11. Claude_15 — Joint Innovation (Flow + Warp + Merge)
+run_one "safnet_claude_15" "model_cmp_claude15"
+
 echo "============================================================"
-echo "Model Comparison Finished. (6 models, MSE loss, crop+geo aug)"
+echo "Model Comparison Finished. (11 models, MSE loss, crop+geo aug)"
 echo ""
 echo "Models compared:"
 echo "  Claude_5:  baseline (DW-Sep + SE, 72ch, 8 blocks)"
@@ -107,6 +122,11 @@ echo "  Claude_7:  SimpleGate + SCA (0.940M, 98.8G)"
 echo "  Claude_8:  Hybrid Conv + MDTA (0.851M, 88.67G)"
 echo "  Claude_9:  FFT-Enhanced Block (0.803M, 70.44G)"
 echo "  Claude_10: Wider + DropPath + Dense Skip (0.881M, 89.38G)"
+echo "  Claude_11: MDTA + DropPath + Dense Skip (0.894M, 100.78G)"
+echo "  Claude_12: Iterative Flow Refinement (0.830M, ~87.8G)"
+echo "  Claude_13: Flow-Guided DCN Warp (~0.866M, ~78.1G)"
+echo "  Claude_14: Learned Attention HDR Merge (~0.843M, ~80.3G)"
+echo "  Claude_15: Joint Innovation (~0.879M, ~95.3G)"
 echo ""
 echo "Check output_log/ for PSNR/SSIM curves and logs."
 echo "============================================================"

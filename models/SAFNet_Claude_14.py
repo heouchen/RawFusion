@@ -1,19 +1,12 @@
 """
-SAFNet_Claude_9 — FFT-Enhanced Block
-=====================================
-Core innovation: Add a parallel frequency-domain branch inside HybridBlock.
-After DW conv + GELU, an FFT branch processes features in spectral domain
-via per-channel complex-valued 2x2 transform, then fuses with the spatial
-branch through learnable weights. Captures global frequency patterns that
-local convolutions miss.
-
-Reference: FocalNet (NeurIPS 2022), FFTformer (ICML 2023)
-
-Changes from Claude_5:
-  - FFT branch added after DW conv, before SE
-  - Per-channel complex spectral filter (grouped 1x1 conv on real+imag)
-  - Learnable spatial/frequency fusion weights
-  - 7 blocks (reduced from 8), 72ch
+SAFNet_Claude_14 — Learned Attention HDR Merge
+===============================================
+Based on Claude_5, keeps RefineNet identical.
+Innovation: Replace handcrafted merge_hdr_5frame with a lightweight
+attention-based merge network that learns optimal per-pixel exposure
+blending weights via softmax attention.
+Ref: Attention-Guided Ghost-Free HDR (CVPR 2019)
+Estimated: ~0.843M params (+13K), ~80.3G MACs (+3.9G)
 """
 import numpy as np
 import torch
@@ -69,6 +62,7 @@ def weight_3expo_high_tog17(img):
 
 def merge_hdr_5frame(short_ldr, mid_ldr, long_ldr,
                      short_lin, mid_lin, long_lin, mask0, mask2):
+    """Original handcrafted merge (kept as backup, not used in Claude_14)."""
     avg_short_lin = sum(short_lin) / len(short_lin)
     avg_mid_lin = sum(mid_lin) / len(mid_lin)
     avg_long_lin = sum(long_lin) / len(long_lin)
@@ -130,17 +124,8 @@ class DeformConvRelu(nn.Module):
         return self.prelu(self.deform(x, offset))
 
 
-# ======================== FFTBlock ========================
-class FFTBlock(nn.Module):
-    """
-    HybridBlock with parallel FFT branch for global frequency processing.
-    After DW conv + GELU, features are processed in both spatial and
-    frequency domains, then fused with learnable weights before SE.
-
-    FFT branch: rfft2 -> per-channel complex transform (grouped 1x1 conv
-    on stacked real+imag, groups=expand_ch for 2x2 complex mixing per
-    channel) -> irfft2 -> weighted fusion with spatial branch.
-    """
+# ======================== HybridBlock ========================
+class HybridBlock(nn.Module):
     def __init__(self, channels, dilation=1, se_reduction=4, expand_ratio=2):
         super().__init__()
         expand_ch = channels * expand_ratio
@@ -151,15 +136,6 @@ class FFTBlock(nn.Module):
         self.dw = nn.Conv2d(expand_ch, expand_ch, 3, 1, dilation, dilation,
                             groups=expand_ch, bias=True)
         self.act = nn.GELU()
-
-        # FFT branch: per-channel complex-valued 2x2 transform
-        # Groups=expand_ch means each group has 2 in (real,imag) -> 2 out
-        self.fft_conv = nn.Conv2d(expand_ch * 2, expand_ch * 2, 1,
-                                  groups=expand_ch, bias=True)
-        # Learnable fusion weights (spatial vs frequency)
-        self.spatial_weight = nn.Parameter(torch.ones(1) * 0.9)
-        self.fft_weight = nn.Parameter(torch.ones(1) * 0.1)
-
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(expand_ch, se_ch, 1, bias=True),
@@ -175,25 +151,6 @@ class FFTBlock(nn.Module):
         y = self.pw1(y)
         y = self.dw(y)
         y = self.act(y)
-
-        # FFT branch
-        _, _, H, W = y.shape
-        # Run FFT path in FP32 for AMP stability: cuFFT half precision only
-        # supports power-of-two sizes, while training crops include 192x384.
-        with torch.amp.autocast(device_type=y.device.type, enabled=False):
-            y_fft = y.float()
-            fft_y = torch.fft.rfft2(y_fft, norm='ortho')
-            # Stack real and imag as interleaved channels for grouped conv
-            fft_features = torch.cat([fft_y.real, fft_y.imag], dim=1)
-            fft_features = self.fft_conv(fft_features)
-            fft_real, fft_imag = fft_features.chunk(2, dim=1)
-            fft_out = torch.fft.irfft2(
-                torch.complex(fft_real, fft_imag), s=(H, W), norm='ortho')
-        fft_out = fft_out.to(dtype=y.dtype)
-
-        # Weighted fusion of spatial and frequency branches
-        y = self.spatial_weight * y + self.fft_weight * fft_out
-
         y = y * self.se(y)
         y = self.pw2(y)
         return x + y * self.scale
@@ -252,12 +209,38 @@ class Decoder(nn.Module):
         return up_flow0, up_flow2, up_mask0, up_mask2
 
 
+# ======================== Learned Merge ========================
+class LearnedMerge(nn.Module):
+    """Lightweight attention network for HDR exposure merge.
+
+    Input: avg_short(3ch) + avg_mid(3ch) + avg_long(3ch) + mask0(1ch) + mask2(1ch) = 11ch
+    Output: merged HDR image (3ch)
+    """
+    def __init__(self):
+        super().__init__()
+        self.feat_net = nn.Sequential(
+            nn.Conv2d(11, 32, 3, 1, 1),
+            nn.PReLU(32),
+            nn.Conv2d(32, 32, 3, 1, 1),
+            nn.PReLU(32),
+        )
+        self.attn_head = nn.Conv2d(32, 3, 1, 1, 0)  # 3 exposure weights
+
+    def forward(self, avg_short, avg_mid, avg_long, mask0, mask2):
+        x = torch.cat([avg_short, avg_mid, avg_long, mask0, mask2], dim=1)
+        feat = self.feat_net(x)
+        weights = torch.softmax(self.attn_head(feat), dim=1)  # (B, 3, H, W)
+        return (weights[:, 0:1] * avg_short +
+                weights[:, 1:2] * avg_mid +
+                weights[:, 2:3] * avg_long)
+
+
 # ======================== RefineNet ========================
 class RefineNet(nn.Module):
     def __init__(self, img_channels=4):
         super().__init__()
         c0, c1, c2 = 18, 36, 18
-        total_c = c0 + c1 + c2  # 72
+        total_c = c0 + c1 + c2
 
         self.conv0 = nn.Sequential(convrelu(img_channels, c0), convrelu(c0, c0))
         self.conv1 = nn.Sequential(
@@ -265,11 +248,16 @@ class RefineNet(nn.Module):
             convrelu(c1, c1))
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), convrelu(c2, c2))
 
-        # 7 FFTBlocks with symmetric dilation
-        dilations = [1, 1, 2, 4, 2, 1, 1]
-        self.blocks = nn.Sequential(*[
-            FFTBlock(total_c, dilation=d) for d in dilations
-        ])
+        self.blocks = nn.Sequential(
+            HybridBlock(total_c, dilation=1),
+            HybridBlock(total_c, dilation=1),
+            HybridBlock(total_c, dilation=2),
+            HybridBlock(total_c, dilation=4),
+            HybridBlock(total_c, dilation=4),
+            HybridBlock(total_c, dilation=2),
+            HybridBlock(total_c, dilation=1),
+            HybridBlock(total_c, dilation=1),
+        )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
         self.pixel_shuffle = nn.PixelShuffle(2)
@@ -293,13 +281,14 @@ class RefineNet(nn.Module):
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
 
-# ======================== SAFNet_Claude_9 ========================
-class SAFNet_Claude_9(nn.Module):
+# ======================== SAFNet_Claude_14 ========================
+class SAFNet_Claude_14(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
         self.decoder = Decoder()
         self.refinenet = RefineNet()
+        self.learned_merge = LearnedMerge()
 
     def forward_flow_mask(self, img0_c, img1_c, img2_c, scale_factor=0.5):
         h, w = img1_c.shape[-2:]
@@ -360,15 +349,12 @@ class SAFNet_Claude_9(nn.Module):
         img2_warp = warp(img2_c, flow0 * 0.67)
         img6_warp = warp(img6_c, flow8 * 0.67)
 
-        img_hdr_m = merge_hdr_5frame(
-            short_ldr=[img0_warp[:, :3], img2_warp[:, :3]],
-            mid_ldr=[img4_c[:, :3]],
-            long_ldr=[img8_warp[:, :3], img6_warp[:, :3]],
-            short_lin=[img0_warp[:, :3], img2_warp[:, :3]],
-            mid_lin=[img4_c[:, :3]],
-            long_lin=[img8_warp[:, :3], img6_warp[:, :3]],
-            mask0=mask0, mask2=mask8
-        )
+        # Learned merge: compute exposure averages then blend with attention
+        avg_short = (img0_warp[:, :3] + img2_warp[:, :3]) / 2.0
+        avg_mid = img4_c[:, :3]
+        avg_long = (img8_warp[:, :3] + img6_warp[:, :3]) / 2.0
+
+        img_hdr_m = self.learned_merge(avg_short, avg_mid, avg_long, mask0, mask8)
 
         if refine:
             return self.refinenet(img0_c, img4_c, img8_c,
@@ -379,16 +365,11 @@ class SAFNet_Claude_9(nn.Module):
 
 
 if __name__ == "__main__":
-    model = SAFNet_Claude_9()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = SAFNet_Claude_14().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
     from ptflops import get_model_complexity_info
-    try:
-        # Use CPU for FLOPs estimation to avoid CUDA OOM when GPU is busy.
-        model_cpu = model.cpu().eval()
-        with torch.no_grad():
-            macs, params = get_model_complexity_info(
-                model_cpu, (36, 384, 768), verbose=False, print_per_layer_stat=True)
-        print(f"MACs: {macs}, Params: {params}")
-    except Exception as e:
-        print(f"FLOPs estimation failed: {e}")
+    macs, params = get_model_complexity_info(
+        model, (36, 384, 768), verbose=False, print_per_layer_stat=True)
+    print(f"MACs: {macs}, Params: {params}")
