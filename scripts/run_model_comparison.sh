@@ -79,41 +79,56 @@ run_one () {
 # 6 个模型逐一训练
 # ==============================================================================
 
-# 1. Claude_5 — 基线 (DW-Sep + SE, 72ch, 8 blocks)
-run_one "safnet_claude_5" "model_cmp_claude5"
+# # 1. Claude_5 — 基线 (DW-Sep + SE, 72ch, 8 blocks)
+# run_one "safnet_claude_5" "model_cmp_claude5"
 
-# 2. Claude_6 — Large Kernel DW 7×7 (ConvNeXt style)
-run_one "safnet_claude_6" "model_cmp_claude6"
+# # 2. Claude_6 — Large Kernel DW 7×7 (ConvNeXt style)
+# run_one "safnet_claude_6" "model_cmp_claude6"
 
-# 3. Claude_7 — SimpleGate + SCA (NAFNet style)
-run_one "safnet_claude_7" "model_cmp_claude7"
+# # 3. Claude_7 — SimpleGate + SCA (NAFNet style)
+# run_one "safnet_claude_7" "model_cmp_claude7"
 
-# 4. Claude_8 — Hybrid Conv + Transposed Attention (Restormer style)
-run_one "safnet_claude_8" "model_cmp_claude8"
+# # 4. Claude_8 — Hybrid Conv + Transposed Attention (Restormer style)
+# run_one "safnet_claude_8" "model_cmp_claude8"
 
-# 5. Claude_9 — FFT-Enhanced Block
-run_one "safnet_claude_9" "model_cmp_claude9"
+# # 5. Claude_9 — FFT-Enhanced Block
+# run_one "safnet_claude_9" "model_cmp_claude9"
 
-# 6. Claude_10 — Wider + DropPath + Dense Skip
-run_one "safnet_claude_10" "model_cmp_claude10"
+# # 6. Claude_10 — Wider + DropPath + Dense Skip
+# run_one "safnet_claude_10" "model_cmp_claude10"
 
-# 7. Claude_11 — MDTA + DropPath + Dense Skip (Claude_8 × Claude_10)
-run_one "safnet_claude_11" "model_cmp_claude11"
+# # 7. Claude_11 — MDTA + DropPath + Dense Skip (Claude_8 × Claude_10)
+# run_one "safnet_claude_11" "model_cmp_claude11"
 
-# 8. Claude_12 — Iterative Flow Refinement (2-pass flow estimation)
-run_one "safnet_claude_12" "model_cmp_claude12"
+# # 8. Claude_12 — Iterative Flow Refinement (2-pass flow estimation)
+# run_one "safnet_claude_12" "model_cmp_claude12"
 
-# 9. Claude_13 — Flow-Guided DCN Warp (deformable alignment)
-run_one "safnet_claude_13" "model_cmp_claude13"
+# # 9. Claude_13 — Flow-Guided DCN Warp (deformable alignment)
+# run_one "safnet_claude_13" "model_cmp_claude13"
 
-# 10. Claude_14 — Learned Attention HDR Merge
-run_one "safnet_claude_14" "model_cmp_claude14"
+# # 10. Claude_14 — Learned Attention HDR Merge
+# run_one "safnet_claude_14" "model_cmp_claude14"
 
-# 11. Claude_15 — Joint Innovation (Flow + Warp + Merge)
-run_one "safnet_claude_15" "model_cmp_claude15"
+# # 11. Claude_15 — Joint Innovation (Flow + Warp + Merge)
+# run_one "safnet_claude_15" "model_cmp_claude15"
+
+# # 12. Claude_16 — 5-Frame Direct Flow (eliminates 0.67x approx)
+# run_one "safnet_claude_16" "model_cmp_claude16"
+
+# 13. Claude_17 — 5-Frame 2-Pass + RefineNet 56ch
+run_one "safnet_claude_17" "model_cmp_claude17"
+
+# 14. Claude_18 — 5-Frame Flow + 5-Frame RefineNet
+run_one "safnet_claude_18" "model_cmp_claude18"
+
+# 15. Claude_19 — 5-Frame 2-Pass + Lite RefineNet 48ch
+run_one "safnet_claude_19" "model_cmp_claude19"
+
+# 16. Claude_20 — 5-Frame 2-Pass + UltraLite RefineNet 40ch
+run_one "safnet_claude_20" "model_cmp_claude20"
 
 echo "============================================================"
-echo "Model Comparison Finished. (11 models, MSE loss, crop+geo aug)"
+echo "Model Comparison Finished. (16 models, MSE loss, crop+geo aug)"
 echo ""
 echo "Models compared:"
 echo "  Claude_5:  baseline (DW-Sep + SE, 72ch, 8 blocks)"
@@ -127,6 +142,11 @@ echo "  Claude_12: Iterative Flow Refinement (0.830M, ~87.8G)"
 echo "  Claude_13: Flow-Guided DCN Warp (~0.866M, ~78.1G)"
 echo "  Claude_14: Learned Attention HDR Merge (~0.843M, ~80.3G)"
 echo "  Claude_15: Joint Innovation (~0.879M, ~95.3G)"
+echo "  Claude_16: 5-Frame Direct Flow (~0.879M, ~95G)"
+echo "  Claude_17: 5-Frame 2-Pass + 56ch RefineNet (~0.76M, ~96G)"
+echo "  Claude_18: 5-Frame + 5-Frame RefineNet (~0.80M, ~88G)"
+echo "  Claude_19: 5-Frame 2-Pass + Lite RefineNet 48ch (to be measured)"
+echo "  Claude_20: 5-Frame 2-Pass + UltraLite RefineNet 40ch (to be measured)"
 echo ""
 echo "Check output_log/ for PSNR/SSIM curves and logs."
 echo "============================================================"

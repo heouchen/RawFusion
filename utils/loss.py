@@ -131,12 +131,34 @@ class MuLawL1FFTLoss(nn.Module):
         return l1 + self.w_fft * fft
 
 
+# ======================== Combined Loss ========================
+
+class L1MuLawL1Loss(nn.Module):
+    """L1 (线性域) + mu-law L1 (感知域) 组合 loss
+    同时优化线性 PSNR 和感知质量（暗区去噪）。
+    L = w_linear * L1(pred, gt) + w_mulaw * L1(T(pred), T(gt))
+    """
+    def __init__(self, mu=5000.0, w_linear=1.0, w_mulaw=1.0):
+        super().__init__()
+        self.mu = mu
+        self.w_linear = w_linear
+        self.w_mulaw = w_mulaw
+
+    def forward(self, pred, gt):
+        l1_linear = F.l1_loss(pred, gt)
+        pred_tm = mu_law_tonemap(pred.clamp(0, 1), self.mu)
+        gt_tm = mu_law_tonemap(gt.clamp(0, 1), self.mu)
+        l1_mulaw = F.l1_loss(pred_tm, gt_tm)
+        return self.w_linear * l1_linear + self.w_mulaw * l1_mulaw
+
+
 # ======================== Loss Registry ========================
 
 LOSS_NAMES = [
     'mse', 'l1', 'charbonnier',
     'mulaw_l1', 'mulaw_charb',
     'mulaw_l1_perceptual', 'mulaw_l1_fft',
+    'l1_mulaw_l1',
 ]
 
 
@@ -150,6 +172,7 @@ def build_loss(name):
         'mulaw_charb': MuLawCharbonnierLoss,
         'mulaw_l1_perceptual': MuLawL1PerceptualLoss,
         'mulaw_l1_fft': MuLawL1FFTLoss,
+        'l1_mulaw_l1': L1MuLawL1Loss,
     }
     if name not in registry:
         raise ValueError(f"Unknown loss '{name}'. Available: {list(registry.keys())}")

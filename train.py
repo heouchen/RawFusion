@@ -162,6 +162,10 @@ def train(
         model = model.cuda()
         loss_fn = loss_fn.cuda()
 
+    # # torch.compile 加速训练（PyTorch 2.0+）
+    # model = torch.compile(model)
+    # print('=> torch.compile enabled')
+
     if mGPU:
         model = nn.DataParallel(model)
     model.train()
