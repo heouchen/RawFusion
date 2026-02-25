@@ -1,0 +1,231 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+%%%%%%%%% PAPER TYPE  - PLEASE UPDATE FOR FINAL VERSION
+% \usepackage[review]{cvpr}      % To produce the REVIEW version
+\usepackage{cvpr}              % To produce the CAMERA-READY version
+%\usepackage[pagenumbers]{cvpr} % To force page numbers, e.g. for an arXiv version
+
+% Include other packages here, before hyperref.
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage[shortlabels]{enumitem}
+\usepackage{color}
+
+% It is strongly recommended to use hyperref, especially for the review version.
+% hyperref with option pagebackref eases the reviewers' job.
+% Please disable hyperref *only* if you encounter grave issues, e.g. with the
+% file validation for the camera-ready version.
+%
+% If you comment hyperref and then uncomment it, you should delete
+% ReviewTempalte.aux before re-running LaTeX.
+% (Or just hit 'q' on the first LaTeX run, let it finish, and you
+%  should be clear).
+\usepackage[pagebackref,breaklinks,colorlinks]{hyperref}
+
+
+% Support for easy cross-referencing
+\usepackage[capitalize]{cleveref}
+\crefname{section}{Sec.}{Secs.}
+\Crefname{section}{Section}{Sections}
+\Crefname{table}{Table}{Tables}
+\crefname{table}{Tab.}{Tabs.}
+
+
+%%%%%%%%% PAPER ID  - PLEASE UPDATE
+\def\cvprPaperID{*****} % *** Enter the CVPR Paper ID here
+\def\confName{CVPR}
+\def\confYear{2025}
+\newcommand{\add}[1]{{\color{blue}#1}}
+
+\begin{document}
+
+%%%%%%%%% TITLE - PLEASE UPDATE
+\title{NTIRE 2025 Efficient Burst HDR and Restoration\\-title of the contribution-}
+
+% \author{
+% Sangmin Lee \hspace{2cm} Eunpil Park \hspace{2cm} Hyunhee Park\\
+% Samsung\\
+% Suwon, South Korea\\
+% {\tt\small \{sanggmin.lee, ep.park, inextg.park\}@samsung.com}
+% % For a paper whose authors are all at the same institution,
+% % omit the following lines up until the closing ``}''.
+% % Additional authors and addresses can be added with ``\and'',
+% % just like the second author.
+% % To save space, use either the email address or home page, not both
+% % \and
+% % Eunpil Park \\
+% % Samsung\\
+% % Suwon, Samsung\\
+% % {\tt\small ep.park@samsung.com}
+% }
+
+
+% \maketitle
+
+
+
+\author{First Author\\
+Institution1\\
+Institution1 address\\
+{\tt\small firstauthor@i1.org}
+% For a paper whose authors are all at the same institution,
+% omit the following lines up until the closing ``}''.
+% Additional authors and addresses can be added with ``\and'',
+% just like the second author.
+% To save space, use either the email address or home page, not both
+\and
+Second Author\\
+Institution2\\
+First line of institution2 address\\
+{\tt\small secondauthor@i2.org}
+}
+\maketitle
+
+
+\section{Introduction}
+
+This factsheet template is meant to structure the description of the contributions made by each participating team in the NTIRE 2025 challenge on \href{https://codalab.lisn.upsaclay.fr/competitions/21316}{Efficient Burst HDR and Restoration}.
+
+
+Ideally, all the aspects enumerated below should be addressed.
+The provided information, the codes/executables and the achieved performance on the testing data are used to decide the awardees of the NTIRE 2025 challenge. 
+
+Reproducibility is a must and needs to be checked for the final test results in order to qualify for the NTIRE awards. Furthermore, as described in the challenge homepage, this challenge have two constraints: 
+\begin{enumerate}
+    \item The number of model parameters must be \textbf{less than 30.0 M}, and
+    \item the FLOPs used to synthesis whole single $768 \times 1536$ sRGB image must be \textbf{less than 4.0 T}.
+\end{enumerate}
+ Therefore, \textbf{please make it sure that your submission satisfies this limitations.}
+ Submissions that violates this rule will be rejected.
+ 
+The competition winners will be decided based on PSNR performance in the model size constraints. The novel and interesting solutions with good visual results are encouraged. Please check the competition webpage and forums for more details.
+
+The winners, the awardees and the top ranking teams will be invited to co-author the NTIRE 2025 challenge report and to submit papers with their solutions to the NTIRE 2025 workshop. Detailed descriptions are much appreciated.
+
+The factsheet, \href{https://github.com/Eve-ctr/RawFusion}{source codes/executables}, trained models should be sent to \textbf{all of the NTIRE 2025 challenge organizers (Sangmin Lee,  Chongyi Li, and Radu Timofte)} by email.
+
+
+\section{Email final submission guide}
+
+\begin{center}
+\fbox{
+\begin{minipage}{0.9\columnwidth}
+\textbf{To:} {leeleesang2@gmail.com,} \\
+$\phantom{111}$ {lichongyi@nankai.edu.cn,} \\ 
+$\phantom{111}$ {Radu.Timofte@uni-wuerzburg.de} \\
+\noindent \textbf{cc:} your\_team\_members \\
+\textbf{Title:} NTIRE 2025 Efficient Burst HDR and Restoration - [TEAM\_ID] - [TEAM\_NAME]
+\end{minipage}
+}
+\end{center}
+
+
+
+
+To get your TEAM\_ID, please register at this \href{https://docs.google.com/spreadsheets/d/11U3h07nikI69hwjAORpajRZEMAw7sfWMjveoLgcinc0/edit?usp=sharing}{Google Sheet}. Please fill in your Team Name, Contact Person, and Contact Email in the first empty row from the top of sheet. \\
+
+In the mail, body contents should include: 
+
+\begin{enumerate}[a)]
+\item team name 
+
+\item team leader's name and email address 
+
+\item rest of the team members 
+
+\item user names on NTIRE 2025 CodaLab competitions 
+
+\item Model architecture and testing codes, pretrained model, and factsheet download command.\\
+\indent~~ e.g. \texttt{git clone ...}, \texttt{wget ...}, or Google Drive download link, etc.
+
+\end{enumerate}
+
+
+
+\noindent Factsheet must be a compiled pdf file together with a zip with .tex factsheet source files. There is no limitation on the number of pages, so please provide a detailed explanation. You may use \href{https://github.com/Eve-ctr/RawFusion/tree/main/Factsheet/Factsheet_latex.zip}{this factsheet format} for instance.
+
+\subsection{Due date}
+Email final submissions received prior to \textbf{March 22\textsuperscript{nd} AOE} (Anywhere On Earth) will be considered.
+
+
+
+\section{Code Submission}
+
+The code and trained models should be organized according to the provided \href{https://github.com/Eve-ctr/RawFusion}{GitHub repository} (updated on 14\textsuperscript{th} March). This code repository provides the basis for comparing participants' various models in this competition. Specifically, you should follow the steps below. \\
+
+\begin{enumerate}
+    \item Register at this \href{https://docs.google.com/spreadsheets/d/11U3h07nikI69hwjAORpajRZEMAw7sfWMjveoLgcinc0/edit?usp=sharing}{Google Sheet} to get your \texttt{[TEAM\_ID]}.
+    \item Git clone \href{https://github.com/Eve-ctr/RawFusion}{the repository.}
+    \item Put your model script under the \texttt{models} folder. Name your model script as \texttt{Model\_[Your\_Team\_ID]\_[Your\_Model\_Name].py}.
+    \item Name your model checkpoint as \texttt{Ckpt\_[Your\_Team\_ID]\_[Your\_Model\_Name].[pth or pt]} and put your trained model under the \texttt{model\_zoo} folder. 
+    \item Modify \texttt{My\_model} in \texttt{test\_demo.py} to import your model.
+    \item \texttt{python test\_demo.py} measures FLOPs and the number of parameters of your model, and generates the result images.
+\end{enumerate}
+\ \newline
+To ensure a fair comparison between participants, please DO NOT modify other codes as much as possible. Only allow minimal modifications to make your model code work. 
+After confirming that your model is working properly, please send us the command to download your code and trained model weights, e.g. \texttt{git clone [Your repository link]} or Google Drive link, etc.
+Organizers will check the model parameters and FLOPs limits and verify that the submitted images are indeed reproducible.
+
+\section{Factsheet Information}
+
+The factsheet should contain the following information. Most importantly, you should describe your method in detail. The training strategy (model architecture, optimization method, learning rate schedule, and other hyperparameters such as batch size, and patch size) and training data (information about the additional trainning data) should also be explained in detail.
+
+\subsection{Team details}
+
+\begin{itemize}
+    \item Team name                                  
+    \item Team leader name                           
+    \item Team leader address, phone number, and email 
+    \item Rest of the team members        
+    \item Team website URL (if any)                   
+    \item Affiliation
+    \item Affiliation of the team and/or team members with NTIRE 2025 sponsors (check the workshop website)
+    \item User names and entries on the NTIRE 2025 Codalab competitions (development/validation and testing phases)
+    \item Best scoring entries of the team during development/validation phases
+    \item Link to the codes/executables of the solution(s)
+\end{itemize}
+
+\subsection{Method details}
+
+You should describe your proposed solution in detail. This part is equivalent to the methodology part of a conference paper submission. The description should cover the following details.
+
+\begin{itemize}
+    \item General method description (How your model is designed.)
+    \item Representative image / diagram / pipeline of the method(s)  
+    \item Training strategy
+    \item Experimental results
+    \item References                                               
+\end{itemize}
+\ \newline
+Additionally, you can refer to the following items to detail your description.
+\begin{itemize}
+    \item Total method complexity (number of parameters, FLOPs, GPU memory consumption, number of activations, runtime)
+    \item Which pre-trained or external methods / models have been used (for any stage, if any) 
+    \item Which additional data has been used in addition to the provided NTIRE training and validation data (at any stage, if any) 
+    \item Training description
+    \item Testing description
+    \item Quantitative and qualitative advantages of the proposed solution
+    \item Results of the comparison to other approaches (if any)
+    \item Results on other benchmarks (if any)
+    \item Novelty degree of the solution and if it has been previously published
+    \item It is OK if the proposed solution is based on other works (papers, reports, Internet sources (links), etc). It is ethically wrong and a misconduct if you are not properly giving credits and hide this information.
+\end{itemize}
+
+
+\section{Other details}
+\begin{itemize}
+    \item Planned submission of a solution(s) description paper at NTIRE 2025 workshop.
+    \item General comments and impressions of the NTIRE 2025 challenge. 
+    \item What do you expect from a new challenge in Burst HDR image fusion, restoration, denoise and enhancement?
+    \item Other comments: encountered difficulties, fairness of the challenge, proposed subcategories, proposed evaluation method(s), etc.
+\end{itemize}
+
+%%%%%%%%% REFERENCES
+{\small
+\bibliographystyle{ieeenat_fullname}
+\bibliography{egbib}
+}
+
+\end{document}

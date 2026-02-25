@@ -115,20 +115,29 @@ run_one () {
 # # 12. Claude_16 — 5-Frame Direct Flow (eliminates 0.67x approx)
 # run_one "safnet_claude_16" "model_cmp_claude16"
 
-# 13. Claude_17 — 5-Frame 2-Pass + RefineNet 56ch
-run_one "safnet_claude_17" "model_cmp_claude17"
+# # 13. Claude_17 — 5-Frame 2-Pass + RefineNet 56ch
+# run_one "safnet_claude_17" "model_cmp_claude17"
 
-# 14. Claude_18 — 5-Frame Flow + 5-Frame RefineNet
-run_one "safnet_claude_18" "model_cmp_claude18"
+# # 14. Claude_18 — 5-Frame Flow + 5-Frame RefineNet
+# run_one "safnet_claude_18" "model_cmp_claude18"
 
-# 15. Claude_19 — 5-Frame 2-Pass + Lite RefineNet 48ch
-run_one "safnet_claude_19" "model_cmp_claude19"
+# # 15. Claude_19 — 5-Frame 2-Pass + Lite RefineNet 48ch
+# run_one "safnet_claude_19" "model_cmp_claude19"
 
-# 16. Claude_20 — 5-Frame 2-Pass + UltraLite RefineNet 40ch
-run_one "safnet_claude_20" "model_cmp_claude20"
+# # 16. Claude_20 — 5-Frame 2-Pass + UltraLite RefineNet 40ch
+# run_one "safnet_claude_20" "model_cmp_claude20"
+
+# 17. Claude_21 — 2-Pass Anchor Flow + RefineNet5Frame 72ch
+run_one "safnet_claude_21" "model_cmp_claude21"
+
+# 18. Claude_22 — 2-Pass Anchor Flow + Per-Frame LearnedMerge5Frame
+run_one "safnet_claude_22" "model_cmp_claude22"
+
+# 19. Claude_23 — 2-Pass Anchor Flow + Frame-Augmented RefineNet
+run_one "safnet_claude_23" "model_cmp_claude23"
 
 echo "============================================================"
-echo "Model Comparison Finished. (16 models, MSE loss, crop+geo aug)"
+echo "Model Comparison Finished. (19 models, MSE loss, crop+geo aug)"
 echo ""
 echo "Models compared:"
 echo "  Claude_5:  baseline (DW-Sep + SE, 72ch, 8 blocks)"
@@ -147,6 +156,9 @@ echo "  Claude_17: 5-Frame 2-Pass + 56ch RefineNet (~0.76M, ~96G)"
 echo "  Claude_18: 5-Frame + 5-Frame RefineNet (~0.80M, ~88G)"
 echo "  Claude_19: 5-Frame 2-Pass + Lite RefineNet 48ch (to be measured)"
 echo "  Claude_20: 5-Frame 2-Pass + UltraLite RefineNet 40ch (to be measured)"
+echo "  Claude_21: 2-Pass Anchor + RefineNet5Frame 72ch (~0.84M, ~93G)"
+echo "  Claude_22: 2-Pass Anchor + Per-Frame Merge 5Frame (~0.88M, ~96G)"
+echo "  Claude_23: 2-Pass Anchor + Frame-Augmented RefineNet (~0.88M, ~96G)"
 echo ""
 echo "Check output_log/ for PSNR/SSIM curves and logs."
 echo "============================================================"
