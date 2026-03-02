@@ -22,6 +22,7 @@ from models import build_model, MODEL_NAMES
 from utils.checkpoint import save_checkpoint
 from utils.utils import resume_or_load
 from utils.loss import build_loss, LOSS_NAMES
+from utils.ema import ModelEMA
 from engine import train_one_epoch, validate
 
 
@@ -60,6 +61,8 @@ def train(
     aug_noise_std=0.0,
     pretrained_path=None,
     loss_name='mulaw_l1',
+    ema_enable=False,
+    ema_decay=0.999,
 ):
     torch.set_num_threads(num_threads)
 
@@ -118,7 +121,7 @@ def train(
         train=True,
         augment=None if use_batch_collate else train_aug,
     )
-    num_workers = 2
+    num_workers = 1
     data_loader = torch.utils.data.DataLoader(
         train_set,
         batch_size=batch_size,
@@ -170,15 +173,21 @@ def train(
         model = nn.DataParallel(model)
     model.train()
 
+    # EMA 权重平均
+    ema = None
+    if ema_enable:
+        ema = ModelEMA(model, decay=ema_decay)
+        print(f'=> EMA enabled (decay={ema_decay})')
+
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
     optimizer.zero_grad()
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epoch, eta_min=1e-6)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(n_epoch - 1, 1), eta_min=1e-6)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     start_epoch, global_step, best_psnr, log_txt_path, log_header_written = resume_or_load(
         model, optimizer, scheduler, scaler, use_amp,
-        restart_train, checkpoint_dir, pretrained_path, log_txt_path
+        restart_train, checkpoint_dir, pretrained_path, log_txt_path, ema=ema
     )
 
     print(f"=> Experiment: {exp_name}")
@@ -199,13 +208,17 @@ def train(
 
         avg_train_loss, step_count = train_one_epoch(
             model, data_loader, optimizer, scaler, use_amp, cuda,
-            epoch, n_epoch, output_dir, loss_fn=loss_fn
+            epoch, n_epoch, output_dir, loss_fn=loss_fn, ema=ema
         )
         global_step += step_count
         epoch_time = time.time() - epoch_start_time
 
-        # 验证集评估
+        # 验证集评估（使用 EMA 权重）
+        if ema is not None:
+            ema.apply(model)
         val_psnr, val_ssim = validate(model, val_loader, use_amp, cuda)
+        if ema is not None:
+            ema.restore(model)
 
         # 打印 epoch 总结
         print(f'\n[Epoch {epoch:04d}] Time: {epoch_time:.1f}s | Train Loss: {avg_train_loss:.5f} | '
@@ -237,10 +250,11 @@ def train(
             }
             if use_amp:
                 save_dict['scaler'] = scaler.state_dict()
+            if ema is not None:
+                save_dict['ema'] = ema.state_dict()
             save_checkpoint(
                 save_dict, is_best, checkpoint_dir, global_step, max_keep=5
             )
-
 
         # decay the learning rate
         scheduler.step()
@@ -288,6 +302,10 @@ if __name__ == '__main__':
     parser.add_argument('--aug_noise_enable', type=int, default=0)
     parser.add_argument('--aug_noise_std', type=float, default=0.0)
 
+    # EMA
+    parser.add_argument('--ema', type=int, default=0, help='Enable EMA weight averaging (0/1)')
+    parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA decay rate')
+
     args = parser.parse_args()
 
     train(
@@ -325,4 +343,6 @@ if __name__ == '__main__':
         aug_noise_std=args.aug_noise_std,
         pretrained_path=args.pretrained,
         loss_name=args.loss,
+        ema_enable=bool(args.ema),
+        ema_decay=args.ema_decay,
     )

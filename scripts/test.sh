@@ -1,0 +1,1 @@
+python eval.py --model safnet_claude_27_v2 --exp_name model_submit_claude27_v2 --tta

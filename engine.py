@@ -10,7 +10,7 @@ from utils.utils import calculate_psnr, calculate_ssim
 to_pil_image = transforms.ToPILImage()
 
 def train_one_epoch(model, data_loader, optimizer, scaler, use_amp, cuda,
-                    epoch, n_epoch, output_dir, loss_fn=None):
+                    epoch, n_epoch, output_dir, loss_fn=None, ema=None):
     """单 epoch 训练，返回 (avg_loss, step_count)"""
     model.train()
     lr_current = optimizer.param_groups[0]['lr']
@@ -33,9 +33,18 @@ def train_one_epoch(model, data_loader, optimizer, scaler, use_amp, cuda,
         with torch.amp.autocast('cuda', enabled=use_amp):
             pred = model(burst_noise)
             loss = loss_fn(pred, gt)
+            # Add auxiliary losses from model (e.g. flow regularization)
+            base_model = model.module if hasattr(model, 'module') else model
+            if hasattr(base_model, '_aux_losses') and base_model._aux_losses:
+                for v in base_model._aux_losses.values():
+                    loss = loss + v
+                base_model._aux_losses = {}
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+
+        if ema is not None:
+            ema.update(model)
 
         loss_val = loss.item()
         epoch_loss += loss_val

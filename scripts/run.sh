@@ -24,7 +24,7 @@ TRAIN_ROOT="${TRAIN_ROOT:-/home/chen/data/ntire2026/hdr/train/}"
 VAL_ROOT="${VAL_ROOT:-/home/chen/data/ntire2026/hdr/validation/}"
 
 # Training Hyperparameters (所有实验保持一致)
-EPOCHS="${EPOCHS:-300}"
+EPOCHS="${EPOCHS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 LR="${LR:-2e-4}"
 LR_DECAY="${LR_DECAY:-0.95}"
@@ -37,18 +37,26 @@ CROP_SIZES="96x192,192x384,384x768"
 
 # 固定损失函数
 LOSS="mse"
-EMA_ENABLE="0"
+
 mkdir -p output_log
+EMA_ENABLE="0"
+pretrained=""
+
+# echo "开始执行..."
+# sleep 3h
+# echo "3小时后继续执行..."
 
 run_one () {
   local model_name="$1"
   local exp_name="$2"
   local ts
   ts="$(date +%Y%m%d_%H%M%S)"
+
   echo "------------------------------------------------------------"
   echo "[${ts}] STARTING: ${exp_name}"
   echo "Model: ${model_name} | Loss: ${LOSS}"
   echo "------------------------------------------------------------"
+
   python train.py \
     --model "${model_name}" \
     --exp_name "${exp_name}" \
@@ -71,34 +79,13 @@ run_one () {
     --aug_exp_enable 0 \
     --aug_wb_enable 0 \
     --aug_noise_enable 0 \
-    --ema "${EMA_ENABLE}"
+    --ema "${EMA_ENABLE}" \
+    --pretrained "${pretrained}"
 }
-run_one "safnet_claude_27_v2" "model_cmp_claude27_v2_1"
+# run_one "safnet_claude_27_v2" "model_submit_claude27_v2"
+# run_one "safnet_claude_29" "model_submit_claude29"
+# run_one "safnet_claude_30" "model_submit_claude30"
+run_one "safnet_claude_31" "model_submit_claude31"
+run_one "safnet_claude_32" "model_submit_claude32"
+run_one "safnet_claude_33" "model_submit_claude33"
 
-CROP_SIZES="192x384,384x768"
-run_one "safnet_claude_27_v2" "model_cmp_claude27_v2_2"
-
-EMA_ENABLE="1"
-CROP_SIZES="96x192,192x384,384x768"
-run_one "safnet_claude_27_v2" "model_cmp_claude27_v2_3"
-
-CROP_SIZES="192x384,384x768"
-run_one "safnet_claude_27_v2" "model_cmp_claude27_v2_4"
-
-# ==============================================================================
-# Claude_29~32: Optimized training recipe for larger models
-# - LR halved (1e-4) for larger param count
-# - Epochs 500 for longer convergence
-# - EMA enabled
-# - Crop sizes 192x384,384x768 (skip 96x192 for these models)
-# ==============================================================================
-EPOCHS="500"
-LR="1e-4"
-EMA_ENABLE="1"
-CROP_SIZES="192x384,384x768"
-
-run_one "safnet_claude_29" "model_cmp_claude29"
-run_one "safnet_claude_30" "model_cmp_claude30"
-run_one "safnet_claude_31" "model_cmp_claude31"
-run_one "safnet_claude_32" "model_cmp_claude32"
-run_one "safnet_claude_33" "model_cmp_claude33"

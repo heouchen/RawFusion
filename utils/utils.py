@@ -61,11 +61,11 @@ def calculate_ssim(output_img, target_img):
 
 def resume_or_load(model, optimizer, scheduler, scaler, use_amp,
                    restart_train, checkpoint_dir, pretrained_path,
-                   log_txt_path):
+                   log_txt_path, ema=None):
     """
     模型加载与重训练逻辑。
     根据 restart_train / pretrained_path 决定：
-      - 续训：从 checkpoint 恢复 model/optimizer/scheduler/scaler 状态
+      - 续训：从 checkpoint 恢复 model/optimizer/scheduler/scaler/ema 状态
       - 预训练迁移：部分加载权重
       - 从零开始训练
 
@@ -84,6 +84,9 @@ def resume_or_load(model, optimizer, scheduler, scaler, use_amp,
             scheduler.load_state_dict(checkpoint['lr_scheduler'])
             if use_amp and 'scaler' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler'])
+            if ema is not None and 'ema' in checkpoint:
+                ema.load_state_dict(checkpoint['ema'])
+                print('=> loaded EMA state from checkpoint')
             log_header_written = False
             if 'log_path' in checkpoint:
                 log_txt_path = checkpoint['log_path']

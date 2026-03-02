@@ -44,7 +44,7 @@ def load_checkpoint(checkpoint_dir, best_or_latest='best'):
         iters = sorted([int(b) for b in basenames if _represent_int(b)])
         checkpoint_file = os.path.join(checkpoint_dir,
                                        '{:06d}.pth.tar'.format(iters[-1]))
-    return torch.load(checkpoint_file)
+    return torch.load(checkpoint_file, map_location='cpu', weights_only=False)
 
 
 def load_model_state_dict(model, state_dict):
@@ -69,7 +69,7 @@ def load_model_state_dict(model, state_dict):
 
 def load_pretrained_weights(model, path):
     """从预训练模型加载权重（支持跨模型迁移，只加载匹配的key）"""
-    ckpt = torch.load(path, map_location='cpu')
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
     pretrained_sd = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
     # 去除 module. 前缀
     cleaned_sd = {}
