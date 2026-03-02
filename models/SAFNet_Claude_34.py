@@ -1,18 +1,59 @@
 """
-SAFNet_Claude_33 — RepNeXt-Enhanced SRP + CondConv
-===================================================
-Based on SAFNet_Claude_27_v2 (832K params, 98.59G MACs).
-Scales params to ~4.27M while keeping MACs under 100G using:
-1. Enhanced Structural Reparameterization (RepDWConvS/M) — zero MACs increase at inference
-2. CondConv2d_1x1 in Decoder (24 experts) and RefineNet main blocks (10 experts)
+SAFNet_Claude_34 — Large-Kernel Reparameterized SRP + CondConv
+==============================================================
+Optimized from SAFNet_Claude_33 with stronger representation under deployment budget:
+1. Add RepDWConvL (7x7 large-kernel reparameterizable DW branch, UniRepLKNet-style design)
+2. Upgrade ChunkConvV3 -> ChunkConvV4 (identity | RepDWConvS | RepDWConvM | RepDWConvL)
+3. Increase decoder/refine capacity with larger channels and selective expansion
 
-Constraints: ~4.27M params, ~98.6G MACs.
+Target after fusion: params < 5M, MACs < 100G while being larger than SAFNet_Claude_33.
 """
 import numpy as np
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.ops import DeformConv2d
+import argparse
+import copy
+import warnings
+
+try:
+    from torchvision.ops import DeformConv2d as _TorchvisionDeformConv2d
+except Exception as e:
+    _TorchvisionDeformConv2d = None
+    _DEFORM_IMPORT_ERROR = e
+else:
+    _DEFORM_IMPORT_ERROR = None
+
+
+if _TorchvisionDeformConv2d is not None:
+    DeformConv2d = _TorchvisionDeformConv2d
+else:
+    class DeformConv2d(nn.Module):
+        """Compatibility fallback for environments without torchvision deform op."""
+        def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                     padding=0, dilation=1, bias=True):
+            super().__init__()
+            self.conv = nn.Conv2d(
+                in_channels, out_channels, kernel_size=kernel_size,
+                stride=stride, padding=padding, dilation=dilation, bias=bias
+            )
+            self._warned = False
+
+        def forward(self, x, offset):
+            if not self._warned:
+                warnings.warn(
+                    "torchvision.ops.DeformConv2d is unavailable; "
+                    "falling back to nn.Conv2d for compatibility.",
+                    RuntimeWarning,
+                )
+                if _DEFORM_IMPORT_ERROR is not None:
+                    warnings.warn(
+                        f"Original import error: {_DEFORM_IMPORT_ERROR}",
+                        RuntimeWarning,
+                    )
+                self._warned = True
+            return self.conv(x)
 
 div_size = 16
 div_flow = 20.0
@@ -208,25 +249,64 @@ class RepDWConvM(nn.Module):
         self.fused = True
 
 
-class StripConv(nn.Module):
-    def __init__(self, channels, strip_k=7, dilation=1):
+class RepDWConvL(nn.Module):
+    """Large-kernel 7x7 reparameterizable DW conv.
+    Branches: 7x7 + 7x3 + 3x7 + serial(1x7->7x1) + identity -> fuse to single 7x7.
+    """
+    def __init__(self, channels, dilation=1):
         super().__init__()
         self.channels = channels
-        self.strip_k = strip_k
-        pad_h = (strip_k // 2) * dilation
-        self.conv_h = nn.Conv2d(channels, channels, (strip_k, 1), 1,
-                                (pad_h, 0), (dilation, 1),
-                                groups=channels, bias=True)
-        self.conv_v = nn.Conv2d(channels, channels, (1, strip_k), 1,
-                                (0, pad_h), (1, dilation),
-                                groups=channels, bias=True)
+        self.dilation = dilation
+        self.fused = False
+        padding3 = 3 * dilation
+        padding1 = dilation
+        kw = dict(in_channels=channels, out_channels=channels, groups=channels)
+
+        self.conv_7x7 = nn.Conv2d(kernel_size=7, padding=padding3,
+                                   dilation=dilation, bias=True, **kw)
+        self.conv_7x3 = nn.Conv2d(kernel_size=(7, 3), padding=(padding3, padding1),
+                                   dilation=dilation, bias=True, **kw)
+        self.conv_3x7 = nn.Conv2d(kernel_size=(3, 7), padding=(padding1, padding3),
+                                   dilation=dilation, bias=True, **kw)
+        self.conv_7w = nn.Conv2d(kernel_size=(1, 7), padding=(0, padding3),
+                                  dilation=(1, dilation), bias=False, **kw)
+        self.conv_7h = nn.Conv2d(kernel_size=(7, 1), padding=(padding3, 0),
+                                  dilation=(dilation, 1), bias=False, **kw)
 
     def forward(self, x):
-        return self.conv_h(x) + self.conv_v(x) + x
+        if self.fused:
+            return self.conv_7x7(x)
+        return (self.conv_7x7(x) + self.conv_7x3(x) + self.conv_3x7(x)
+                + self.conv_7h(self.conv_7w(x)) + x)
 
-# ======================== ChunkConvV3: Multi-Scale DW Conv ========================
-class ChunkConvV3(nn.Module):
-    """4-group chunked DW conv: identity | RepDWConvS | RepDWConvM | StripConv."""
+    @torch.no_grad()
+    def fuse(self):
+        if self.fused:
+            return
+        w = self.conv_7x7.weight.data.clone()
+        b = self.conv_7x7.bias.data.clone()
+
+        w += F.pad(self.conv_7x3.weight.data, [2, 2, 0, 0])
+        b += self.conv_7x3.bias.data
+
+        w += F.pad(self.conv_3x7.weight.data, [0, 0, 2, 2])
+        b += self.conv_3x7.bias.data
+
+        w_serial = torch.einsum("bcnx,bcyn->bcyx",
+                                 self.conv_7w.weight.data,
+                                 self.conv_7h.weight.data)
+        w += w_serial
+        w[:, 0, 3, 3] += 1.0
+
+        self.conv_7x7.weight.data.copy_(w)
+        self.conv_7x7.bias.data.copy_(b)
+        del self.conv_7x3, self.conv_3x7, self.conv_7w, self.conv_7h
+        self.fused = True
+
+
+# ======================== ChunkConvV4: Multi-Scale DW Conv ========================
+class ChunkConvV4(nn.Module):
+    """4-group chunked DW conv: identity | RepDWConvS | RepDWConvM | RepDWConvL."""
     def __init__(self, channels, dilation=1):
         super().__init__()
         assert channels % 4 == 0
@@ -234,19 +314,19 @@ class ChunkConvV3(nn.Module):
         self.g = g
         self.rep3 = RepDWConvS(g, dilation=dilation)
         self.rep5 = RepDWConvM(g, dilation=dilation)
-        self.strip = StripConv(g, strip_k=7, dilation=dilation)
+        self.rep7 = RepDWConvL(g, dilation=dilation)
 
     def forward(self, x):
         g = self.g
         x0, x1, x2, x3 = x[:, :g], x[:, g:2*g], x[:, 2*g:3*g], x[:, 3*g:]
-        return torch.cat([x0, self.rep3(x1), self.rep5(x2), self.strip(x3)], dim=1)
+        return torch.cat([x0, self.rep3(x1), self.rep5(x2), self.rep7(x3)], dim=1)
 
 # ======================== RepNeXtBlock ========================
 class RepNeXtBlock(nn.Module):
     def __init__(self, channels, dilation=1, se_reduction=4, expand_ratio=2,
                  cond=False, num_experts=12):
         super().__init__()
-        expand_ch = channels * expand_ratio
+        expand_ch = int(np.ceil((channels * float(expand_ratio)) / 4.0) * 4)
         se_ch = max(expand_ch // se_reduction, 8)
         self.norm = nn.GroupNorm(1, channels)
         if cond:
@@ -255,7 +335,7 @@ class RepNeXtBlock(nn.Module):
         else:
             self.pw1 = nn.Conv2d(channels, expand_ch, 1, bias=True)
             self.pw2 = nn.Conv2d(expand_ch, channels, 1, bias=True)
-        self.dw = ChunkConvV3(expand_ch, dilation=dilation)
+        self.dw = ChunkConvV4(expand_ch, dilation=dilation)
         self.act = nn.GELU()
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -289,11 +369,11 @@ class Encoder(nn.Module):
         )
         self.pyramid3 = nn.Sequential(
             convrelu(48, 48, 3, 2, 1),
-            RepNeXtBlock(48)
+            RepNeXtBlock(48, expand_ratio=2.25)
         )
         self.pyramid4 = nn.Sequential(
             convrelu(48, 48, 3, 2, 1),
-            RepNeXtBlock(48)
+            RepNeXtBlock(48, expand_ratio=2.25)
         )
 
     def forward(self, img_c):
@@ -331,12 +411,12 @@ class DecoderDCN(nn.Module):
     def __init__(self):
         super().__init__()
         self.fgdcn = FlowGuidedDCN(48)
-        self.conv1 = DeformConvRelu(150, 96)
+        self.conv1 = DeformConvRelu(150, 100)
         self.blocks = nn.Sequential(
-            RepNeXtBlock(96, cond=True, num_experts=24),
-            RepNeXtBlock(96, cond=True, num_experts=24),
+            RepNeXtBlock(100, cond=True, num_experts=24, expand_ratio=2.0),
+            RepNeXtBlock(100, cond=True, num_experts=24, expand_ratio=2.0),
         )
-        self.conv_out = deconv(96, 6)
+        self.conv_out = deconv(100, 6)
 
     def forward(self, f0, f1, f2, flow0, flow2, mask0, mask2):
         f0_warp = self.fgdcn(f0, flow0)
@@ -374,7 +454,7 @@ class LearnedMerge3Frame(nn.Module):
 class RefineNet(nn.Module):
     def __init__(self, img_channels=4):
         super().__init__()
-        c0, c1, c2 = 24, 48, 24
+        c0, c1, c2 = 24, 52, 24
         total_c = c0 + c1 + c2
 
         self.conv0 = nn.Sequential(convrelu(img_channels, c0), RepNeXtBlock(c0))
@@ -385,11 +465,11 @@ class RefineNet(nn.Module):
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), RepNeXtBlock(c2))
 
         self.blocks = nn.Sequential(
-            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10),
-            RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10),
-            RepNeXtBlock(total_c, dilation=4, cond=True, num_experts=10),
-            RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10),
-            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10),
+            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2.0),
+            RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.0),
+            RepNeXtBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=2.0),
+            RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.0),
+            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2.0),
         )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
@@ -412,8 +492,8 @@ class RefineNet(nn.Module):
                                      mode="bilinear", align_corners=False)
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
-# ======================== SAFNet_Claude_33 ========================
-class SAFNet_Claude_33(nn.Module):
+# ======================== SAFNet_Claude_34 ========================
+class SAFNet_Claude_34(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
@@ -423,15 +503,15 @@ class SAFNet_Claude_33(nn.Module):
 
     def fuse_reparam(self):
         for m in self.modules():
-            if isinstance(m, (RepDWConvS, RepDWConvM)):
+            if isinstance(m, (RepDWConvS, RepDWConvM, RepDWConvL)):
                 m.fuse()
 
     def forward_flow_mask(self, img0_c, img4_c, img8_c, scale_factor=0.5):
         h, w = img4_c.shape[-2:]
         org_size = (int(h), int(w))
         input_size = (
-            int(div_size * np.ceil(h * scale_factor / div_size)),
-            int(div_size * np.ceil(w * scale_factor / div_size)))
+            int(div_size * math.ceil(float(h) * scale_factor / div_size)),
+            int(div_size * math.ceil(float(w) * scale_factor / div_size)))
 
         if input_size != org_size:
             img0_c = F.interpolate(img0_c, size=input_size, mode='bilinear', align_corners=False)
@@ -514,18 +594,50 @@ class SAFNet_Claude_33(nn.Module):
             return F.interpolate(img_hdr_m, scale_factor=2,
                                  mode="bilinear", align_corners=False)
 
+def _format_count(num):
+    if num >= 1e12:
+        return f"{num / 1e12:.3f}T"
+    if num >= 1e9:
+        return f"{num / 1e9:.3f}G"
+    if num >= 1e6:
+        return f"{num / 1e6:.3f}M"
+    if num >= 1e3:
+        return f"{num / 1e3:.3f}K"
+    return str(num)
+
+
+def _print_profile(height=384, width=768):
+    device = torch.device("cpu")  # macOS compatibility (MPS deform op is often unsupported).
+    dummy = torch.ones(1, 36, height, width, device=device)
+
+    model_before = SAFNet_Claude_34().to(device).eval()
+    model_after = copy.deepcopy(model_before).to(device).eval()
+    model_after.fuse_reparam()
+
+    params_before = sum(p.numel() for p in model_before.parameters())
+    params_after = sum(p.numel() for p in model_after.parameters())
+
+    print(f"Input shape: (1, 36, {height}, {width})")
+    print(f"Params before fusion: {params_before:,} ({_format_count(params_before)})")
+    print(f"Params after fusion : {params_after:,} ({_format_count(params_after)})")
+    print(f"Param delta         : {params_after - params_before:,}")
+
+    try:
+        from fvcore.nn import FlopCountAnalysis
+    except Exception as e:
+        print(f"FLOPs skipped (fvcore unavailable): {e}")
+        return
+
+    flops_before = FlopCountAnalysis(model_before, dummy).total()
+    flops_after = FlopCountAnalysis(model_after, dummy).total()
+    print(f"FLOPs before fusion : {flops_before:.0f} ({_format_count(flops_before)})")
+    print(f"FLOPs after fusion  : {flops_after:.0f} ({_format_count(flops_after)})")
+    print(f"FLOPs delta          : {flops_after - flops_before:.0f}")
+
+
 if __name__ == "__main__":
-    device = torch.device('cpu')
-    model = SAFNet_Claude_33().to(device)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
-
-    from fvcore.nn import FlopCountAnalysis, flop_count_table
-    flops = FlopCountAnalysis(model, torch.ones(1, 36, 384, 768).to(device))
-    print(f"Total FLOPs of the model : {flops.total() / (1000**4) :.3f}(T)")
-
-    model.fuse_reparam()
-    flops = FlopCountAnalysis(model, torch.ones(1, 36, 384, 768).to(device))
-    print(f"Total FLOPs of the model after fusion: {flops.total() / (1000**4) :.3f}(T)")
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--height", type=int, default=384, help="Input height for profiling.")
+    parser.add_argument("--width", type=int, default=768, help="Input width for profiling.")
+    args = parser.parse_args()
+    _print_profile(height=args.height, width=args.width)
