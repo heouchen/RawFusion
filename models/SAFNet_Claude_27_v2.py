@@ -415,3 +415,10 @@ if __name__ == "__main__":
     macs, params = get_model_complexity_info(
         model, (36, 384, 768), verbose=False, print_per_layer_stat=False)
     print(f"MACs: {macs}, Params: {params}")
+
+    from fvcore.nn import FlopCountAnalysis, flop_count_table
+    model.fuse_reparam()
+    flops = FlopCountAnalysis(model, torch.ones(1, 36, 384, 768).to(device))
+    print(f"Total FLOPs of the model after fusion: {flops.total() / (1000**4) :.3f}(T)")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")

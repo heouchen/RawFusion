@@ -374,7 +374,7 @@ class LearnedMerge3Frame(nn.Module):
 class RefineNet(nn.Module):
     def __init__(self, img_channels=4):
         super().__init__()
-        c0, c1, c2 = 24, 48, 24
+        c0, c1, c2 = 32, 48, 24
         total_c = c0 + c1 + c2
 
         self.conv0 = nn.Sequential(convrelu(img_channels, c0), RepNeXtBlock(c0))
@@ -513,6 +513,7 @@ class SAFNet_Claude_33(nn.Module):
         else:
             return F.interpolate(img_hdr_m, scale_factor=2,
                                  mode="bilinear", align_corners=False)
+
 
 if __name__ == "__main__":
     device = torch.device('cpu')

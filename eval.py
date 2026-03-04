@@ -92,6 +92,7 @@ def eval_model(
     save_gt=False,
     save_input=False,
     tta=False,
+    rep=False,
 ):
     """Evaluate a model on the validation set and save output TIF images.
 
@@ -107,6 +108,8 @@ def eval_model(
         tta: Enable 8-fold D4 test-time augmentation
     """
     print(f'=== Evaluation: {model_name} (exp: {exp_name}) ===')
+    if rep:
+        print(f'    Rep: enabled (using reparameterized model)')
     if tta:
         print(f'    TTA: enabled (8-fold D4 geometric ensemble)')
     print()
@@ -122,11 +125,19 @@ def eval_model(
             f'Available dirs: {os.listdir(checkpoint_dir_root)}'
         )
 
-    ckpt_path = find_best_checkpoint(checkpoint_dir)
-    if ckpt_path is None:
-        raise FileNotFoundError(
-            f'No checkpoint found in {checkpoint_dir}'
-        )
+    if rep:
+        ckpt_path = os.path.join(checkpoint_dir, 'model_best_rep.pth.tar')
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(
+                f'Reparameterized checkpoint not found: {ckpt_path}\n'
+                f'Run reparam_model.py first to generate it.'
+            )
+    else:
+        ckpt_path = find_best_checkpoint(checkpoint_dir)
+        if ckpt_path is None:
+            raise FileNotFoundError(
+                f'No checkpoint found in {checkpoint_dir}'
+            )
     print(f'=> Checkpoint: {ckpt_path}')
 
     # ---- Output image directory (inside checkpoint dir) ----
@@ -147,14 +158,19 @@ def eval_model(
 
     # ---- Model ----
     model = build_model(model_name)
-    if cuda:
-        model = model.cuda()
-    if mgpu:
-        model = nn.DataParallel(model)
 
     # ---- Load weights ----
     checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     load_model_state_dict(model, checkpoint['state_dict'])
+
+    # ---- Reparameterize / Fuse ----
+    if rep:
+        model.fuse_reparam()
+
+    if cuda:
+        model = model.cuda()
+    if mgpu:
+        model = nn.DataParallel(model)
     epoch = checkpoint.get('epoch', '?')
     best_psnr = checkpoint.get('best_psnr', checkpoint.get('best_loss', '?'))
     print(f'=> Loaded checkpoint (epoch {epoch}, best_psnr {best_psnr})')
@@ -284,6 +300,8 @@ if __name__ == '__main__':
                         help='Also save input frame images')
     parser.add_argument('--tta', action='store_true',
                         help='Enable 8-fold D4 test-time augmentation (flip+rot90)')
+    parser.add_argument('--rep', action='store_true',
+                        help='Use reparameterized model (load model_best_rep.pth.tar)')
     args = parser.parse_args()
 
     eval_model(
@@ -296,4 +314,5 @@ if __name__ == '__main__':
         save_gt=args.save_gt,
         save_input=args.save_input,
         tta=args.tta,
+        rep=args.rep,
     )
