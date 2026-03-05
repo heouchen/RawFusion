@@ -14,6 +14,11 @@ def train_one_epoch(model, data_loader, optimizer, scaler, use_amp, cuda,
     """单 epoch 训练，返回 (avg_loss, step_count)"""
     model.train()
     lr_current = optimizer.param_groups[0]['lr']
+    base_model = model.module if hasattr(model, 'module') else model
+    if hasattr(loss_fn, 'set_epoch'):
+        loss_fn.set_epoch(epoch, n_epoch)
+    if hasattr(base_model, 'set_spd_weight'):
+        base_model.set_spd_weight(float(getattr(loss_fn, 'current_w_spd', 0.0)))
 
     # 训练循环（使用 tqdm 显示进度）
     pbar = tqdm(data_loader, desc=f'Epoch {epoch}/{n_epoch} [LR={lr_current:.6f}]', ncols=100)
@@ -34,7 +39,6 @@ def train_one_epoch(model, data_loader, optimizer, scaler, use_amp, cuda,
             pred = model(burst_noise)
             loss = loss_fn(pred, gt)
             # Add auxiliary losses from model (e.g. flow regularization)
-            base_model = model.module if hasattr(model, 'module') else model
             if hasattr(base_model, '_aux_losses') and base_model._aux_losses:
                 for v in base_model._aux_losses.values():
                     loss = loss + v

@@ -131,6 +131,98 @@ class MuLawL1FFTLoss(nn.Module):
         return l1 + self.w_fft * fft
 
 
+class ProgressiveMuLawFreqLoss(nn.Module):
+    """PFL: mu-law L1 + progressive high-frequency spectral loss."""
+    def __init__(self, mu=5000.0, w_fft_min=0.02, w_fft_max=0.16, warmup_ratio=0.35):
+        super().__init__()
+        self.mu = mu
+        self.w_fft_min = float(w_fft_min)
+        self.w_fft_max = float(w_fft_max)
+        self.warmup_ratio = float(warmup_ratio)
+        self.current_w_fft = self.w_fft_min
+
+    def set_epoch(self, epoch, total_epochs):
+        if total_epochs <= 1:
+            self.current_w_fft = self.w_fft_max
+            return
+        t = float(epoch) / float(total_epochs - 1)
+        pivot = min(max(self.warmup_ratio, 0.05), 0.95)
+        if t <= pivot:
+            p = t / pivot
+            self.current_w_fft = self.w_fft_min + 0.5 * (self.w_fft_max - self.w_fft_min) * p
+        else:
+            p = (t - pivot) / (1.0 - pivot)
+            cosine_ramp = 0.5 - 0.5 * math.cos(math.pi * p)
+            self.current_w_fft = self.w_fft_min + (self.w_fft_max - self.w_fft_min) * cosine_ramp
+
+    @staticmethod
+    def _weighted_amp_l1(pred_tm, gt_tm):
+        pred_fft = torch.fft.rfft2(pred_tm, norm='ortho')
+        gt_fft = torch.fft.rfft2(gt_tm, norm='ortho')
+        pred_amp = torch.abs(pred_fft)
+        gt_amp = torch.abs(gt_fft)
+
+        h = pred_amp.shape[-2]
+        w = pred_amp.shape[-1]
+        fy = torch.linspace(0.0, 1.0, h, device=pred_tm.device, dtype=pred_tm.dtype).view(1, 1, h, 1)
+        fx = torch.linspace(0.0, 1.0, w, device=pred_tm.device, dtype=pred_tm.dtype).view(1, 1, 1, w)
+        freq_weight = torch.sqrt(fx * fx + fy * fy).clamp(min=0.05)
+        return F.l1_loss(pred_amp * freq_weight, gt_amp * freq_weight)
+
+    def forward(self, pred, gt):
+        pred_tm = mu_law_tonemap(pred.clamp(0, 1), self.mu)
+        gt_tm = mu_law_tonemap(gt.clamp(0, 1), self.mu)
+        l1 = F.l1_loss(pred_tm, gt_tm)
+        hf = self._weighted_amp_l1(pred_tm, gt_tm)
+        return l1 + self.current_w_fft * hf
+
+
+class MIRAGEHybridLoss(nn.Module):
+    """MIRAGE-style hybrid objective: mu-law L1 + Fourier + scheduled SPD aux weight."""
+    def __init__(
+        self,
+        mu=5000.0,
+        w_fft_min=0.03,
+        w_fft_max=0.14,
+        w_spd_min=0.0,
+        w_spd_max=0.05,
+        warmup_ratio=0.35,
+    ):
+        super().__init__()
+        self.mu = mu
+        self.w_fft_min = float(w_fft_min)
+        self.w_fft_max = float(w_fft_max)
+        self.w_spd_min = float(w_spd_min)
+        self.w_spd_max = float(w_spd_max)
+        self.warmup_ratio = float(warmup_ratio)
+        self.current_w_fft = self.w_fft_min
+        self.current_w_spd = self.w_spd_min
+
+    def set_epoch(self, epoch, total_epochs):
+        if total_epochs <= 1:
+            self.current_w_fft = self.w_fft_max
+            self.current_w_spd = self.w_spd_max
+            return
+        t = float(epoch) / float(total_epochs - 1)
+        pivot = min(max(self.warmup_ratio, 0.05), 0.95)
+        if t <= pivot:
+            p = t / pivot
+            self.current_w_fft = self.w_fft_min + 0.5 * (self.w_fft_max - self.w_fft_min) * p
+            self.current_w_spd = self.w_spd_min + 0.25 * (self.w_spd_max - self.w_spd_min) * p
+        else:
+            p = (t - pivot) / (1.0 - pivot)
+            cosine_ramp = 0.5 - 0.5 * math.cos(math.pi * p)
+            self.current_w_fft = self.w_fft_min + (self.w_fft_max - self.w_fft_min) * cosine_ramp
+            self.current_w_spd = self.w_spd_min + (self.w_spd_max - self.w_spd_min) * cosine_ramp
+
+    def forward(self, pred, gt):
+        pred_tm = mu_law_tonemap(pred.clamp(0, 1), self.mu)
+        gt_tm = mu_law_tonemap(gt.clamp(0, 1), self.mu)
+        l1 = F.l1_loss(pred_tm, gt_tm)
+        hf = ProgressiveMuLawFreqLoss._weighted_amp_l1(pred_tm, gt_tm)
+        return l1 + self.current_w_fft * hf
+
+
 # ======================== Combined Loss ========================
 
 class L1MuLawL1Loss(nn.Module):
@@ -158,6 +250,8 @@ LOSS_NAMES = [
     'mse', 'l1', 'charbonnier',
     'mulaw_l1', 'mulaw_charb',
     'mulaw_l1_perceptual', 'mulaw_l1_fft',
+    'pfl_mulaw_l1',
+    'mirage_hybrid',
     'l1_mulaw_l1',
 ]
 
@@ -172,6 +266,8 @@ def build_loss(name):
         'mulaw_charb': MuLawCharbonnierLoss,
         'mulaw_l1_perceptual': MuLawL1PerceptualLoss,
         'mulaw_l1_fft': MuLawL1FFTLoss,
+        'pfl_mulaw_l1': ProgressiveMuLawFreqLoss,
+        'mirage_hybrid': MIRAGEHybridLoss,
         'l1_mulaw_l1': L1MuLawL1Loss,
     }
     if name not in registry:
