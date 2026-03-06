@@ -11,6 +11,7 @@ from models.SAFNet_Claude_37 import SAFNet_Claude_37
 from models.SAFNet_Claude_38 import SAFNet_Claude_38
 from models.SAFNet_Claude_39 import SAFNet_Claude_39
 from models.SAFNet_Claude_40 import SAFNet_Claude_40
+from models.SAFNet_Claude_41 import SAFNet_Claude_41
 
 _MODEL_MAP = {
     'safnet_claude_27': SAFNet_Claude_27,
@@ -26,6 +27,7 @@ _MODEL_MAP = {
     'safnet_claude_38': SAFNet_Claude_38,
     'safnet_claude_39': SAFNet_Claude_39,
     'safnet_claude_40': SAFNet_Claude_40,
+    'safnet_claude_41': SAFNet_Claude_41,
 }
 
 MODEL_NAMES = list(_MODEL_MAP.keys())
