@@ -91,6 +91,7 @@ def validate(model, val_loader, use_amp, cuda):
 
             with torch.amp.autocast('cuda', enabled=use_amp):
                 pred = model(burst_noise)
+                pred = torch.clamp(pred, 0.0, 1.0)
             val_psnr_sum += calculate_psnr(pred.unsqueeze(1), gt.unsqueeze(1))
             val_ssim_sum += calculate_ssim(pred.unsqueeze(1), gt.unsqueeze(1))
             val_count += 1

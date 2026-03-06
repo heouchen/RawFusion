@@ -260,7 +260,7 @@ class CustomDataset(torch.utils.data.Dataset):
             
             # GT (768, 1536, 3) -> (3, 768, 1536)
             gt_tensor = self.transform(gt_arr) if self.transform else torch.from_numpy(gt_arr).permute(2,0,1).float()
-            
+
             inputs = torch.stack(input_tensors)  # (9, 4, 384, 768)
             self.cache.append((inputs, gt_tensor))
 

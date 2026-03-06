@@ -508,12 +508,15 @@ class FreqPromptGate(nn.Module):
         )
 
     def forward(self, x):
-        freq = torch.fft.rfft2(x, norm='ortho')
+        # cuFFT in half precision only supports power-of-two sizes.
+        # Force FFT path to fp32 under AMP, then cast stats back.
+        x_fft = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+        freq = torch.fft.rfft2(x_fft, norm='ortho')
         amp = torch.abs(freq)
         amp_low = F.adaptive_avg_pool2d(amp, 1)
         amp_high = F.adaptive_avg_pool2d(amp, 4).mean(dim=(-2, -1), keepdim=True)
         spatial_stat = x.mean(dim=(-2, -1), keepdim=True)
-        freq_stat = amp_low + (amp_high - amp_low)
+        freq_stat = (amp_low + (amp_high - amp_low)).to(spatial_stat.dtype)
         gate = self.proj(torch.cat([spatial_stat, freq_stat], dim=1))
         return x * (0.5 + gate)
 
@@ -673,7 +676,7 @@ class RefineNet(nn.Module):
         res = self.pixel_shuffle(self.conv3(feat))
         img_hdr_m_up = F.interpolate(img_hdr_m, scale_factor=2,
                                      mode="bilinear", align_corners=False)
-        return torch.clamp(img_hdr_m_up + res, 0, 1)
+        return img_hdr_m_up + res
 
 # ======================== SAFNet_Claude_36 ========================
 class SAFNet_Claude_36(nn.Module):

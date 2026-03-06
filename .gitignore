@@ -2,5 +2,4 @@ __pycache__/
 *.pyc
 checkpoint_dir/
 output/
-output_log/
 logs_dir/

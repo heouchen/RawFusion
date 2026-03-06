@@ -89,5 +89,8 @@ run_one () {
 # run_one "safnet_claude_32" "model_submit_claude32"
 # run_one "safnet_claude_33" "model_submit_claude33"
 # run_one "safnet_claude_34" "model_submit_claude34"
-run_one "safnet_claude_35" "model_submit_claude35"
+# run_one "safnet_claude_35" "model_submit_claude35"
+run_one "safnet_claude_36" "model_submit_claude36"
+run_one "safnet_claude_37" "model_submit_claude37"
+
 

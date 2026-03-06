@@ -607,7 +607,7 @@ class RefineNet(nn.Module):
         res = self.pixel_shuffle(self.conv3(feat))
         img_hdr_m_up = F.interpolate(img_hdr_m, scale_factor=2,
                                      mode="bilinear", align_corners=False)
-        return torch.clamp(img_hdr_m_up + res, 0, 1)
+        return img_hdr_m_up + res
 
 # ======================== SAFNet_Claude_37 ========================
 class SAFNet_Claude_37(nn.Module):
