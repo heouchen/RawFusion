@@ -1,3 +1,4 @@
+from models.UNet import UNet
 from models.SAFNet_Claude_27 import SAFNet_Claude_27
 from models.SAFNet_Claude_29 import SAFNet_Claude_29
 from models.SAFNet_Claude_30 import SAFNet_Claude_30
@@ -14,6 +15,7 @@ from models.SAFNet_Claude_40 import SAFNet_Claude_40
 from models.SAFNet_Claude_41 import SAFNet_Claude_41
 
 _MODEL_MAP = {
+    'unet': UNet,
     'safnet_claude_27': SAFNet_Claude_27,
     'safnet_claude_29': SAFNet_Claude_29,
     'safnet_claude_30': SAFNet_Claude_30,
