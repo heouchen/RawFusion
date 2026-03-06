@@ -1,5 +1,5 @@
 """
-SAFNet_Claude_27_v2 — 3-Frame Input + RepNeXt Block Everywhere
+SAFNet_Claude_27 — 3-Frame Input + RepNeXt Block Everywhere
 ==============================================================
 Based on SAFNet_Claude_27. Optimized for NTIRE 2026 HDR Competition.
 Input reduced to 3 frames (img0, img4, img8) to save computation.
@@ -304,8 +304,8 @@ class RefineNet(nn.Module):
                                      mode="bilinear", align_corners=False)
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
-# ======================== SAFNet_Claude_27_v2 ========================
-class SAFNet_Claude_27_v2(nn.Module):
+# ======================== SAFNet_Claude_27 ========================
+class SAFNet_Claude_27(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
@@ -408,7 +408,7 @@ class SAFNet_Claude_27_v2(nn.Module):
 
 if __name__ == "__main__":
     device = torch.device('cpu')
-    model = SAFNet_Claude_27_v2().to(device)
+    model = SAFNet_Claude_27().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
     from ptflops import get_model_complexity_info
