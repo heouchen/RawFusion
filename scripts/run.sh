@@ -33,7 +33,10 @@ MGPU="${MGPU:-1}"
 RESTART_TRAIN="${RESTART_TRAIN:-1}"
 
 # 固定增广策略（crop + geo）
+# Baseline: 随机多尺度 crop
 CROP_SIZES="96x192,192x384,384x768"
+PROGRESSIVE_CROP_ENABLE="${PROGRESSIVE_CROP_ENABLE:-0}"
+PROGRESSIVE_CROP_SCHEDULE="${PROGRESSIVE_CROP_SCHEDULE:-96x192@0.3,192x384@0.7,384x768@1.0}"
 
 # 固定损失函数
 LOSS="mse"
@@ -55,6 +58,7 @@ run_one () {
   echo "------------------------------------------------------------"
   echo "[${ts}] STARTING: ${exp_name}"
   echo "Model: ${model_name} | Loss: ${LOSS}"
+  echo "Crop mode: $([[ \"${PROGRESSIVE_CROP_ENABLE}\" == \"1\" ]] && echo progressive || echo random)"
   echo "------------------------------------------------------------"
 
   python train.py \
@@ -73,6 +77,8 @@ run_one () {
     --aug_enable 1 \
     --aug_crop_enable 1 \
     --aug_crop_sizes "${CROP_SIZES}" \
+    --aug_progressive_crop_enable "${PROGRESSIVE_CROP_ENABLE}" \
+    --aug_progressive_crop_schedule "${PROGRESSIVE_CROP_SCHEDULE}" \
     --aug_geo_enable 1 \
     --aug_geo_flip_enable 1 \
     --aug_geo_rot90_enable 1 \
@@ -82,6 +88,11 @@ run_one () {
     --ema "${EMA_ENABLE}" \
     --pretrained "${pretrained}"
 }
+# Curriculum example:
+# PROGRESSIVE_CROP_ENABLE=1 \
+# PROGRESSIVE_CROP_SCHEDULE="96x192@0.3,192x384@0.7,384x768@1.0" \
+# bash scripts/run.sh
+
 # run_one "safnet_claude_27_v2" "model_submit_claude27_v2"
 # run_one "safnet_claude_29" "model_submit_claude29"
 # run_one "safnet_claude_30" "model_submit_claude30"
@@ -95,5 +106,4 @@ run_one () {
 run_one "safnet_claude_38" "model_submit_claude38"
 run_one "safnet_claude_39" "model_submit_claude39"
 run_one "safnet_claude_40" "model_submit_claude40"
-
 

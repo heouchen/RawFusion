@@ -21,7 +21,72 @@ def parse_crop_sizes(s: str):
     return sizes if sizes else None
 
 
-def make_train_collate(augment: HDRBurstAugment, crop_sizes, batch_geom=False):
+def parse_progressive_crop_schedule(s: str):
+    """
+    Parse "HxW@r,HxW@r,..." to [((H, W), cumulative_ratio)].
+    Example: "96x192@0.3,192x384@0.7,384x768@1.0"
+    """
+    if not s:
+        return None
+
+    schedule = []
+    prev_ratio = 0.0
+    for part in s.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if "@" not in part:
+            raise ValueError(f"Invalid progressive crop entry: {part}. Expect HxW@ratio.")
+        size_part, ratio_part = part.split("@", 1)
+        sizes = parse_crop_sizes(size_part)
+        if not sizes or len(sizes) != 1:
+            raise ValueError(f"Invalid progressive crop size: {size_part}. Expect one HxW value.")
+        ratio = float(ratio_part)
+        if ratio <= 0.0 or ratio > 1.0:
+            raise ValueError(f"Invalid progressive crop ratio: {ratio}. Expect 0 < ratio <= 1.")
+        if ratio <= prev_ratio:
+            raise ValueError("Progressive crop ratios must be strictly increasing.")
+        schedule.append((sizes[0], ratio))
+        prev_ratio = ratio
+
+    if not schedule:
+        return None
+    if abs(schedule[-1][1] - 1.0) > 1e-6:
+        raise ValueError("Progressive crop schedule must end at ratio 1.0.")
+    return schedule
+
+
+class CropScheduleController:
+    def __init__(self, random_crop_sizes=None, progressive_enable=False, progressive_schedule=None):
+        self.random_crop_sizes = random_crop_sizes
+        self.progressive_enable = bool(progressive_enable)
+        self.progressive_schedule = progressive_schedule or []
+        self.current_epoch = 0
+        self.total_epochs = 1
+
+    def set_epoch(self, epoch: int, total_epochs: int):
+        self.current_epoch = int(epoch)
+        self.total_epochs = max(int(total_epochs), 1)
+
+    def current_crop_size(self):
+        if not self.progressive_enable:
+            return None
+        progress = float(self.current_epoch + 1) / float(self.total_epochs)
+        for crop_size, ratio in self.progressive_schedule:
+            if progress <= ratio:
+                return crop_size
+        return self.progressive_schedule[-1][0] if self.progressive_schedule else None
+
+    def describe_mode(self):
+        crop_size = self.current_crop_size()
+        if crop_size is not None:
+            return "progressive", f"{crop_size[0]}x{crop_size[1]}"
+        if self.random_crop_sizes:
+            return "random", ",".join(f"{h}x{w}" for h, w in self.random_crop_sizes)
+        return "fixed", ""
+
+
+def make_train_collate(augment: HDRBurstAugment, crop_sizes, batch_geom=False, crop_controller: CropScheduleController = None):
     """
     Batch-level multi-scale crop: ensure same HxW within a batch.
     """
@@ -36,7 +101,14 @@ def make_train_collate(augment: HDRBurstAugment, crop_sizes, batch_geom=False):
         if batch_geom and augment.geo_enable:
             geom = augment._sample_geom()
 
-        if crop_sizes:
+        progressive_crop_size = crop_controller.current_crop_size() if crop_controller is not None else None
+        if progressive_crop_size is not None:
+            ch, cw = progressive_crop_size
+            augmented = [
+                augment.augment_with_crop_size(inp, tgt, (ch, cw), geom=geom)
+                for (inp, tgt) in batch
+            ]
+        elif crop_sizes:
             idx = int(torch.randint(0, len(crop_sizes), (1,)).item())
             ch, cw = crop_sizes[idx]
             augmented = [

@@ -17,7 +17,12 @@ from datetime import datetime
 from torchvision.transforms import transforms
 
 from DataLoader.custom_data_class import CustomDataset, HDRBurstAugment
-from DataLoader.collate import make_train_collate, parse_crop_sizes
+from DataLoader.collate import (
+    CropScheduleController,
+    make_train_collate,
+    parse_crop_sizes,
+    parse_progressive_crop_schedule,
+)
 from models import build_model, MODEL_NAMES
 from utils.checkpoint import save_checkpoint
 from utils.utils import resume_or_load
@@ -43,6 +48,8 @@ def train(
     aug_crop_enable=True,
     aug_crop_size=256,
     aug_crop_sizes=None,
+    aug_progressive_crop_enable=False,
+    aug_progressive_crop_schedule=None,
     aug_crop_even_offset=False,
     aug_geo_enable=False,
     aug_geo_flip_enable=True,
@@ -112,9 +119,15 @@ def train(
         noise_std=aug_noise_std,
         clamp=True,
     )
-    use_batch_crop = bool(aug_enable and aug_crop_enable and aug_crop_sizes)
+    use_progressive_crop = bool(aug_enable and aug_crop_enable and aug_progressive_crop_enable and aug_progressive_crop_schedule)
+    use_batch_crop = bool(aug_enable and aug_crop_enable and (aug_crop_sizes or use_progressive_crop))
     use_batch_geom = bool(aug_enable and aug_geo_enable and aug_geo_rot90_enable)
     use_batch_collate = use_batch_crop or use_batch_geom
+    crop_controller = CropScheduleController(
+        random_crop_sizes=aug_crop_sizes,
+        progressive_enable=use_progressive_crop,
+        progressive_schedule=aug_progressive_crop_schedule,
+    )
     train_set = CustomDataset(
         root_dir=train_root,
         transform=transforms.ToTensor(),
@@ -129,7 +142,12 @@ def train(
         num_workers=num_workers,
         pin_memory=cuda,
         persistent_workers=(num_workers > 0),
-        collate_fn=make_train_collate(train_aug, aug_crop_sizes, batch_geom=use_batch_geom) if use_batch_collate else None,
+        collate_fn=make_train_collate(
+            train_aug,
+            aug_crop_sizes,
+            batch_geom=use_batch_geom,
+            crop_controller=crop_controller,
+        ) if use_batch_collate else None,
     )
     print("Train loader length:", len(data_loader))
 
@@ -192,6 +210,10 @@ def train(
 
     print(f"=> Experiment: {exp_name}")
     crop_desc = aug_crop_sizes if aug_crop_sizes else aug_crop_size
+    if aug_progressive_crop_enable and aug_progressive_crop_schedule:
+        crop_desc = " -> ".join(
+            f"{h}x{w}@{ratio:.2f}" for (h, w), ratio in aug_progressive_crop_schedule
+        )
     print(
         f"=> Augment: enable={aug_enable}, crop={aug_crop_enable}({crop_desc}, even={aug_crop_even_offset}), "
         f"geo={aug_geo_enable}(flip={aug_geo_flip_enable}, rot90={aug_geo_rot90_enable}), "
@@ -205,6 +227,10 @@ def train(
     for epoch in range(start_epoch, n_epoch):
         epoch_start_time = time.time()
         lr_current = optimizer.param_groups[0]['lr']
+        crop_controller.set_epoch(epoch, n_epoch)
+        crop_mode, crop_value = crop_controller.describe_mode()
+        if aug_enable and aug_crop_enable:
+            print(f"=> Epoch {epoch:04d} crop mode: {crop_mode} | crop: {crop_value}")
 
         avg_train_loss, step_count = train_one_epoch(
             model, data_loader, optimizer, scaler, use_amp, cuda,
@@ -227,9 +253,12 @@ def train(
         # 保存当前 epoch 的 loss / PSNR / SSIM 到 output_log（txt 格式，文件名带时间戳）
         with open(log_txt_path, 'a', encoding='utf-8') as f:
             if not log_header_written:
-                f.write('epoch\tloss\tpsnr\tssim\ttime_s\tlr\n')
+                f.write('epoch\tloss\tpsnr\tssim\ttime_s\tlr\tcrop_mode\tcrop_size\n')
                 log_header_written = True
-            f.write(f'{epoch}\t{avg_train_loss:.6f}\t{val_psnr:.6f}\t{val_ssim:.6f}\t{epoch_time:.2f}\t{lr_current:.8f}\n')
+            f.write(
+                f'{epoch}\t{avg_train_loss:.6f}\t{val_psnr:.6f}\t{val_ssim:.6f}\t'
+                f'{epoch_time:.2f}\t{lr_current:.8f}\t{crop_mode}\t{crop_value}\n'
+            )
 
         # 基于 val PSNR 判断 is_best（而非 train loss，避免增广实验偏置）
         if val_psnr > best_psnr:
@@ -285,6 +314,11 @@ if __name__ == '__main__':
     parser.add_argument('--aug_crop_enable', type=int, default=1)
     parser.add_argument('--aug_crop_size', type=int, default=256) # 减半
     parser.add_argument('--aug_crop_sizes', type=str, default="96x192,192x384,384x768") # 减半
+    parser.add_argument('--aug_progressive_crop_enable', type=int, default=0,
+                        help='Enable epoch-wise progressive crop schedule (0/1)')
+    parser.add_argument('--aug_progressive_crop_schedule', type=str,
+                        default="96x192@0.3,192x384@0.7,384x768@1.0",
+                        help='Progressive crop schedule as HxW@ratio,HxW@ratio,...')
     parser.add_argument('--aug_crop_even_offset', type=int, default=0) # Packing后无需强制偶数
     parser.add_argument('--aug_geo_enable', type=int, default=0)
     parser.add_argument('--aug_geo_flip_enable', type=int, default=1)
@@ -325,6 +359,8 @@ if __name__ == '__main__':
         aug_crop_enable=bool(args.aug_crop_enable),
         aug_crop_size=args.aug_crop_size,
         aug_crop_sizes=parse_crop_sizes(args.aug_crop_sizes),
+        aug_progressive_crop_enable=bool(args.aug_progressive_crop_enable),
+        aug_progressive_crop_schedule=parse_progressive_crop_schedule(args.aug_progressive_crop_schedule),
         aug_crop_even_offset=bool(args.aug_crop_even_offset),
         aug_geo_enable=bool(args.aug_geo_enable),
         aug_geo_flip_enable=bool(args.aug_geo_flip_enable),
