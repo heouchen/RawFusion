@@ -56,11 +56,49 @@ def parse_progressive_crop_schedule(s: str):
     return schedule
 
 
+def parse_progressive_batch_sizes(s: str):
+    """
+    Parse "HxW@batch,HxW@batch,..." to {(H, W): batch_size}.
+    Example: "96x192@16,192x384@8,384x768@4"
+    """
+    if not s:
+        return None
+
+    batch_sizes = {}
+    for part in s.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if "@" not in part:
+            raise ValueError(f"Invalid progressive batch entry: {part}. Expect HxW@batch.")
+        size_part, batch_part = part.split("@", 1)
+        sizes = parse_crop_sizes(size_part)
+        if not sizes or len(sizes) != 1:
+            raise ValueError(f"Invalid progressive batch crop size: {size_part}. Expect one HxW value.")
+        batch_size = int(batch_part)
+        if batch_size <= 0:
+            raise ValueError(f"Invalid progressive batch size: {batch_size}. Expect > 0.")
+        batch_sizes[sizes[0]] = batch_size
+
+    return batch_sizes if batch_sizes else None
+
+
 class CropScheduleController:
-    def __init__(self, random_crop_sizes=None, progressive_enable=False, progressive_schedule=None):
+    def __init__(
+        self,
+        random_crop_sizes=None,
+        progressive_enable=False,
+        progressive_schedule=None,
+        default_batch_size=1,
+        progressive_batch_enable=False,
+        progressive_batch_sizes=None,
+    ):
         self.random_crop_sizes = random_crop_sizes
         self.progressive_enable = bool(progressive_enable)
         self.progressive_schedule = progressive_schedule or []
+        self.default_batch_size = int(default_batch_size)
+        self.progressive_batch_enable = bool(progressive_batch_enable)
+        self.progressive_batch_sizes = progressive_batch_sizes or {}
         self.current_epoch = 0
         self.total_epochs = 1
 
@@ -76,6 +114,12 @@ class CropScheduleController:
             if progress <= ratio:
                 return crop_size
         return self.progressive_schedule[-1][0] if self.progressive_schedule else None
+
+    def current_batch_size(self):
+        crop_size = self.current_crop_size()
+        if (not self.progressive_batch_enable) or (crop_size is None):
+            return self.default_batch_size
+        return int(self.progressive_batch_sizes.get(crop_size, self.default_batch_size))
 
     def describe_mode(self):
         crop_size = self.current_crop_size()

@@ -1,11 +1,11 @@
 """
-SAFNet_Claude_41 — Reparameterized Merge/Tail Upgrade over Claude_40
-====================================================================
-Built on SAFNet_Claude_40 with the validated focus kept on merge and reconstruction:
-1. Replace merge stem with a lightweight reparameterizable feature stem.
-2. Upgrade reliable merge into a compressed two-branch reparameterizable merge head.
-3. Replace the high-resolution tail with a reparameterizable tail block.
-4. Keep the flow/mask alignment path unchanged to isolate merge/reconstruction gains.
+SAFNet_Claude_41 — Conservative Claude_40 Enlargement for PSNR
+===============================================================
+Built on SAFNet_Claude_40 with PSNR-oriented low-risk capacity increases:
+1. Keep the input grouping and alignment path unchanged from Claude_40.
+2. Enlarge the shallow merge stem and reliable merge hidden channels.
+3. Keep the explicit 5x5 high-resolution tail, with a slightly wider tail hidden size.
+4. Retain the original deploy-time reparameterization path from Claude_40 only.
 
 Target (fused): <= 5M params, <= 100G FLOPs for input (1, 36, 384, 768),
 which corresponds to full-size RGB output (1, 3, 768, 1536).
@@ -528,53 +528,28 @@ class ExposureGroupPreparer(nn.Module):
         return img0_c, img4_c, img8_c
 
 
-class RepMergeUnit(nn.Module):
-    def __init__(self, channels, kernel="S", expand_ratio=1.5):
-        super().__init__()
-        hidden = int(math.ceil((channels * float(expand_ratio)) / 4.0) * 4)
-        self.norm = nn.GroupNorm(1, channels)
-        self.expand = nn.Conv2d(channels, hidden, 1, 1, 0, bias=True)
-        if kernel == "M":
-            self.dw = RepDWConvM(hidden)
-        else:
-            self.dw = RepDWConvS(hidden)
-        self.act = nn.GELU()
-        self.project = nn.Conv2d(hidden, channels, 1, 1, 0, bias=True)
-        self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
-
-    def forward(self, x):
-        y = self.norm(x)
-        y = self.expand(y)
-        y = self.dw(y)
-        y = self.act(y)
-        y = self.project(y)
-        return x + y * self.scale
-
-
-class RepMergeStem(nn.Module):
-    def __init__(self, in_channels=4, stem_channels=12, out_channels=8):
+class MergeFeatureStem(nn.Module):
+    def __init__(self, in_channels=4, out_channels=8):
         super().__init__()
         self.stem = nn.Sequential(
-            convrelu(in_channels, stem_channels, 3, 1, 1),
-            RepMergeUnit(stem_channels, kernel="S", expand_ratio=1.5),
-            nn.Conv2d(stem_channels, out_channels, 1, 1, 0, bias=True),
+            convrelu(in_channels, out_channels, 3, 1, 1),
+            nn.Conv2d(out_channels, out_channels, 3, 1, 1, groups=out_channels, bias=True),
+            nn.PReLU(out_channels),
         )
 
     def forward(self, x):
         return self.stem(x)
 
 # ======================== Learned Merge (3-Frame) ========================
-class ReliableMerge3FrameV2(nn.Module):
+class ReliableMerge3Frame(nn.Module):
     def __init__(self, feat_channels=8, hidden_channels=40):
         super().__init__()
         in_channels = 9 + feat_channels * 3 + 2 + 2 + 3
-        self.input_proj = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, 1, 1, 0, bias=True),
-            nn.PReLU(hidden_channels),
+        self.feat_net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, 3, 1, 1, bias=True),
+            RepNeXtBlock(hidden_channels, expand_ratio=1.75),
+            RepNeXtBlock(hidden_channels, expand_ratio=1.75),
         )
-        self.shared = RepMergeUnit(hidden_channels, kernel="M", expand_ratio=1.5)
-        self.weight_branch = RepMergeUnit(hidden_channels, kernel="S", expand_ratio=1.5)
-        self.residual_branch = RepMergeUnit(hidden_channels, kernel="S", expand_ratio=1.5)
         self.attn_head = nn.Conv2d(hidden_channels, 3, 1, 1, 0, bias=True)
         self.residual_head = nn.Conv2d(hidden_channels, 3, 3, 1, 1, bias=True)
 
@@ -592,13 +567,12 @@ class ReliableMerge3FrameV2(nn.Module):
             flow0_mag, flow8_mag,
             exp_low, exp_mid, exp_high,
         ], dim=1)
-        feat = self.input_proj(x)
-        feat = self.shared(feat)
-        weights = torch.softmax(self.attn_head(self.weight_branch(feat)), dim=1)
+        feat = self.feat_net(x)
+        weights = torch.softmax(self.attn_head(feat), dim=1)
         merged = (weights[:, 0:1] * img0_w +
                   weights[:, 1:2] * img4 +
                   weights[:, 2:3] * img8_w)
-        residual = 0.10 * torch.tanh(self.residual_head(self.residual_branch(feat)))
+        residual = 0.10 * torch.tanh(self.residual_head(feat))
         return torch.clamp(merged + residual, 0, 1)
 
 # ======================== RefineNet ========================
@@ -644,11 +618,11 @@ class RefineNet(nn.Module):
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
 
-class RepHighResTailBlock(nn.Module):
+class HighResTailBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.norm = nn.GroupNorm(1, channels)
-        self.dw = RepDWConvS(channels)
+        self.dw = nn.Conv2d(channels, channels, 5, 1, 2, groups=channels, bias=True)
         self.pw1 = nn.Conv2d(channels, channels * 2, 1, 1, 0, bias=True)
         self.act = nn.GELU()
         self.pw2 = nn.Conv2d(channels * 2, channels, 1, 1, 0, bias=True)
@@ -663,14 +637,14 @@ class RepHighResTailBlock(nn.Module):
         return x + y * self.scale
 
 
-class RepHighResTail(nn.Module):
-    def __init__(self, hidden_channels=16):
+class HighResRefineTail(nn.Module):
+    def __init__(self, hidden_channels=14):
         super().__init__()
         self.in_proj = nn.Sequential(
             nn.Conv2d(3, hidden_channels, 3, 1, 1, bias=True),
             nn.PReLU(hidden_channels),
         )
-        self.block = RepHighResTailBlock(hidden_channels)
+        self.block = HighResTailBlock(hidden_channels)
         self.out_proj = nn.Conv2d(hidden_channels, 3, 3, 1, 1, bias=True)
 
     def forward(self, x):
@@ -679,10 +653,10 @@ class RepHighResTail(nn.Module):
         return self.out_proj(feat)
 
 
-class RefineNetPlusV2(RefineNet):
+class RefineNetPlus(RefineNet):
     def __init__(self, img_channels=4):
         super().__init__(img_channels=img_channels)
-        self.tail = RepHighResTail(hidden_channels=16)
+        self.tail = HighResRefineTail(hidden_channels=14)
 
     def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
         out = super().forward(img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m)
@@ -704,9 +678,9 @@ class SAFNet_Claude_41(nn.Module):
         self.adapter_l2 = FlowFeatureAdapter(48)
         self.adapter_l3 = FlowFeatureAdapter(48)
         self.adapter_l4 = FlowFeatureAdapter(48)
-        self.merge_stem = RepMergeStem(4, stem_channels=12, out_channels=8)
-        self.learned_merge = ReliableMerge3FrameV2(feat_channels=8, hidden_channels=40)
-        self.refinenet = RefineNetPlusV2()
+        self.merge_stem = MergeFeatureStem(4, 8)
+        self.learned_merge = ReliableMerge3Frame(feat_channels=8, hidden_channels=40)
+        self.refinenet = RefineNetPlus()
 
     def fuse_reparam(self):
         for m in self.modules():
