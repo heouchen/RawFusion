@@ -134,7 +134,7 @@ def train(
         train=True,
         augment=None if use_batch_collate else train_aug,
     )
-    num_workers = 1
+    num_workers = num_threads
     data_loader = torch.utils.data.DataLoader(
         train_set,
         batch_size=batch_size,
@@ -161,9 +161,9 @@ def train(
     )
     val_loader = torch.utils.data.DataLoader(
         val_set,
-        batch_size=1,
+        batch_size=4,
         shuffle=False,
-        num_workers=2,
+        num_workers=4,
         pin_memory=cuda,
         persistent_workers=True,
     )
@@ -261,29 +261,29 @@ def train(
             )
 
         # 基于 val PSNR 判断 is_best（而非 train loss，避免增广实验偏置）
-        if val_psnr > best_psnr:
-            is_best = True
-            best_psnr = val_psnr
-        else:
-            is_best = False
+        # if val_psnr > best_psnr:
+        #     is_best = True
+        #     best_psnr = val_psnr
+        # else:
+        #     is_best = False
 
-        if epoch % 5 == 0 or is_best:
-            save_dict = {
-                'epoch': epoch + 1,
-                'global_iter': global_step,
-                'state_dict': model.state_dict(),
-                'best_psnr': best_psnr,
-                'optimizer': optimizer.state_dict(),
-                'lr_scheduler': scheduler.state_dict(),
-                'log_path': log_txt_path,
-            }
-            if use_amp:
-                save_dict['scaler'] = scaler.state_dict()
-            if ema is not None:
-                save_dict['ema'] = ema.state_dict()
-            save_checkpoint(
-                save_dict, is_best, checkpoint_dir, global_step, max_keep=5
-            )
+        # if epoch % 5 == 0 or is_best:
+        #     save_dict = {
+        #         'epoch': epoch + 1,
+        #         'global_iter': global_step,
+        #         'state_dict': model.state_dict(),
+        #         'best_psnr': best_psnr,
+        #         'optimizer': optimizer.state_dict(),
+        #         'lr_scheduler': scheduler.state_dict(),
+        #         'log_path': log_txt_path,
+        #     }
+        #     if use_amp:
+        #         save_dict['scaler'] = scaler.state_dict()
+        #     if ema is not None:
+        #         save_dict['ema'] = ema.state_dict()
+        #     save_checkpoint(
+        #         save_dict, is_best, checkpoint_dir, global_step, max_keep=5
+        #     )
 
         # decay the learning rate
         scheduler.step()
@@ -300,7 +300,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--lr_decay', type=float, default=0.95)
-    parser.add_argument('--num_threads', type=int, default=1)
+    parser.add_argument('--num_threads', type=int, default=4)
     parser.add_argument('--cuda', type=int, default=1)
     parser.add_argument('--mgpu', type=int, default=1)
     parser.add_argument('--restart_train', type=int, default=1)

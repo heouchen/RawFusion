@@ -10,7 +10,7 @@ import torch.nn.functional as F
 class UNet(nn.Module):
     def __init__(
         self,
-        in_channels=9,  # 9 frames concat through channel dimension
+        in_channels=36,  # 9 frames concat through channel dimension
         n_classes=3,
         depth=4,
         wf=6,
@@ -73,7 +73,9 @@ class UNet(nn.Module):
             x = up(x, blocks[-i - 1])
 
         output = self.last(x)
-
+        # Inputs are packed Bayer at half resolution; GT is full resolution.
+        # Upsample prediction by 2x to match GT spatial size.
+        output = F.interpolate(output, scale_factor=2, mode='bilinear', align_corners=False)
         return output
 
 
@@ -135,5 +137,5 @@ if __name__ == "__main__":
     modelviz = UNet().to(device)
     # 4. get_model_complexity_info 打印运算浮点数和参数量
     from ptflops import get_model_complexity_info
-    macs, params = get_model_complexity_info(modelviz, (9, 512, 512), verbose=True, print_per_layer_stat=True)
+    macs, params = get_model_complexity_info(modelviz, (36, 512, 512), verbose=True, print_per_layer_stat=True)
     print(macs, params)

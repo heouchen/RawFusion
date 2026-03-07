@@ -24,8 +24,8 @@ TRAIN_ROOT="${TRAIN_ROOT:-/home/chen/data/ntire2026/hdr/train/}"
 VAL_ROOT="${VAL_ROOT:-/home/chen/data/ntire2026/hdr/validation/}"
 
 # Training Hyperparameters (所有实验保持一致)
-EPOCHS="${EPOCHS:-100}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
+EPOCHS="${EPOCHS:-500}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
 LR="${LR:-2e-4}"
 LR_DECAY="${LR_DECAY:-0.95}"
 CUDA="${CUDA:-1}"
@@ -103,7 +103,21 @@ run_one () {
 # run_one "safnet_claude_35" "model_submit_claude35"
 # run_one "safnet_claude_36" "model_submit_claude36"
 # run_one "safnet_claude_37" "model_submit_claude37"
-run_one "safnet_claude_38" "model_submit_claude38"
-run_one "safnet_claude_39" "model_submit_claude39"
-run_one "safnet_claude_40" "model_submit_claude40"
+# run_one "safnet_claude_38" "model_submit_claude38"
+# run_one "safnet_claude_39" "model_submit_claude39"
+# run_one "safnet_claude_40" "model_submit_claude40"
+# run_one "safnet_claude_41" "model_submit_claude41"
 
+run_one "unet" "model_submit_unet_mse"
+
+EMA_ENABLE='1'
+run_one "unet" "model_submit_unet_ema"
+EMA_ENABLE='0'
+
+LOSS="l1"
+run_one "unet" "model_submit_unet_l1"
+LOSS="mse"
+
+PROGRESSIVE_CROP_ENABLE=1 \
+PROGRESSIVE_CROP_SCHEDULE="96x192@0.3,192x384@0.7,384x768@1.0" \
+run_one "unet" "model_submit_unet_mse_progressive"
