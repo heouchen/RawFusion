@@ -9,7 +9,6 @@ set -euo pipefail
 # 固定条件：
 #   - Loss: MSE
 #   - 增广: crop (多尺度) + geometric (flip + rot90)
-#   - 其它增广关闭 (exp / wb / noise)
 #   - 训练超参统一
 #
 # Usage:
@@ -19,13 +18,35 @@ set -euo pipefail
 #   EPOCHS=200 BATCH_SIZE=1 CUDA=0 bash scripts/run_model_comparison.sh
 # ==============================================================================
 
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -gpu|--gpu)
+      export CUDA_VISIBLE_DEVICES="$2"
+      export CUDA=1
+      # If multiple GPUs are specified (e.g., "0,1"), enable mgpu; otherwise disable it.
+      if [[ "$2" == *","* ]]; then
+        export MGPU=1
+      else
+        export MGPU=0
+      fi
+      echo "Using GPU(s): $2 (CUDA_VISIBLE_DEVICES=$2, CUDA=$CUDA, MGPU=$MGPU)"
+      shift 2
+      ;;
+    *)
+      # Ignore other arguments
+      shift
+      ;;
+  esac
+done
+
 # Data Paths
 TRAIN_ROOT="${TRAIN_ROOT:-/home/chen/data/ntire2026/hdr/train/}"
 VAL_ROOT="${VAL_ROOT:-/home/chen/data/ntire2026/hdr/validation/}"
 
 # Training Hyperparameters (所有实验保持一致)
-EPOCHS="${EPOCHS:-500}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
+EPOCHS="${EPOCHS:-100}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
 LR="${LR:-2e-4}"
 LR_DECAY="${LR_DECAY:-0.95}"
 CUDA="${CUDA:-1}"
@@ -87,9 +108,6 @@ run_one () {
     --aug_geo_enable 1 \
     --aug_geo_flip_enable 1 \
     --aug_geo_rot90_enable 1 \
-    --aug_exp_enable 0 \
-    --aug_wb_enable 0 \
-    --aug_noise_enable 0 \
     --ema "${EMA_ENABLE}" \
     --pretrained "${pretrained}"
 }
@@ -100,7 +118,7 @@ run_one () {
 # PROGRESSIVE_BATCH_SIZES="96x192@16,192x384@8,384x768@4" \
 # bash scripts/run.sh
 
-# run_one "safnet_claude_27_v2" "model_submit_claude27_v2"
+# run_one "safnet_claude_27" "model_submit_claude27"
 # run_one "safnet_claude_29" "model_submit_claude29"
 # run_one "safnet_claude_30" "model_submit_claude30"
 # run_one "safnet_claude_31" "model_submit_claude31"
@@ -114,17 +132,21 @@ run_one () {
 # run_one "safnet_claude_39" "model_submit_claude39"
 # run_one "safnet_claude_40" "model_submit_claude40"
 # run_one "safnet_claude_41" "model_submit_claude41"
+# run_one "safnet_claude_42" "model_submit_claude42"
+# run_one "safnet_claude_43" "model_submit_claude43"
+# run_one "safnet_claude_44" "model_submit_claude44"
+# run_one "safnet_claude_45" "model_submit_claude45"
+# run_one "safnet_claude_46" "model_submit_claude46"
+run_one "safnet_claude_47" "model_submit_claude47"
+run_one "safnet_claude_48" "model_submit_claude48"
+run_one "safnet_claude_49" "model_submit_claude49"
 
-run_one "unet" "model_submit_unet_mse"
+# LOSS="l1"
+# run_one "safnet_claude_41" "model_submit_claude41_l1"
+# LOSS="mse"
 
-EMA_ENABLE='1'
-run_one "unet" "model_submit_unet_ema"
-EMA_ENABLE='0'
-
-LOSS="l1"
-run_one "unet" "model_submit_unet_l1"
-LOSS="mse"
-
-PROGRESSIVE_CROP_ENABLE=1 \
-PROGRESSIVE_CROP_SCHEDULE="96x192@0.3,192x384@0.7,384x768@1.0" \
-run_one "unet" "model_submit_unet_mse_progressive"
+# PROGRESSIVE_CROP_ENABLE=1 \
+# PROGRESSIVE_CROP_SCHEDULE="96x192@0.3,192x384@0.7,384x768@1.0" \
+# PROGRESSIVE_BATCH_ENABLE=1 \
+# PROGRESSIVE_BATCH_SIZES="96x192@16,192x384@8,384x768@4" \
+# run_one "unet" "model_submit_unet_mse_progressive"

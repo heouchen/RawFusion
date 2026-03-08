@@ -23,15 +23,6 @@ class HDRBurstAugment:
         geo_enable: bool = False,
         geo_flip_enable: bool = True,
         geo_rot90_enable: bool = True,
-        exp_enable: bool = False,
-        exp_range_low: Tuple[float, float] = (0.9, 1.1),
-        exp_range_mid: Tuple[float, float] = (0.9, 1.1),
-        exp_range_high: Tuple[float, float] = (0.9, 1.1),
-        exp_global: bool = False,
-        wb_enable: bool = False,
-        wb_gain_delta: float = 0.05,
-        noise_enable: bool = False,
-        noise_std: float = 0.0,
         clamp: bool = True,
     ):
         self.enable = bool(enable)
@@ -42,15 +33,6 @@ class HDRBurstAugment:
         self.geo_enable = bool(geo_enable)
         self.geo_flip_enable = bool(geo_flip_enable)
         self.geo_rot90_enable = bool(geo_rot90_enable)
-        self.exp_enable = bool(exp_enable)
-        self.exp_range_low = exp_range_low
-        self.exp_range_mid = exp_range_mid
-        self.exp_range_high = exp_range_high
-        self.exp_global = bool(exp_global)
-        self.wb_enable = bool(wb_enable)
-        self.wb_gain_delta = float(wb_gain_delta)
-        self.noise_enable = bool(noise_enable)
-        self.noise_std = float(noise_std)
         self.clamp = bool(clamp)
 
     def _pick_crop_size(self):
@@ -107,45 +89,6 @@ class HDRBurstAugment:
             target = torch.rot90(target, k=rot_k, dims=[-2, -1])
         return inputs, target
 
-    def _apply_exposure_jitter(self, inputs: torch.Tensor, target: torch.Tensor):
-        # inputs: (9, 4, H, W), target: (3, H*2, W*2)
-
-        if self.exp_global:
-            # 全局增益：所有帧和 GT 乘同一个系数 (模拟场景亮度变化)
-            # 使用 mid range 作为全局范围
-            lo, hi = self.exp_range_mid
-            g = (hi - lo) * torch.rand(1).item() + lo
-            return inputs * g, target * g
-        else:
-            # 独立增益：每帧独立随机 (模拟帧间曝光抖动，GT 不变)
-            ranges = [
-                self.exp_range_low, self.exp_range_low, self.exp_range_low,
-                self.exp_range_mid, self.exp_range_mid, self.exp_range_mid,
-                self.exp_range_high, self.exp_range_high, self.exp_range_high,
-            ]
-            gains = []
-            for lo, hi in ranges:
-                g = (hi - lo) * torch.rand(1).item() + lo
-                gains.append(g)
-            gains = torch.tensor(gains, dtype=inputs.dtype, device=inputs.device).view(9, 1, 1, 1)
-            return inputs * gains, target
-
-    def _apply_wb_jitter(self, inputs: torch.Tensor):
-        # inputs: (9, 4, H, W), packing order: [R, G1, G2, B] (index 0,1,2,3)
-        delta = self.wb_gain_delta
-        if delta <= 0:
-            return inputs
-
-        # Burst 内所有帧共享相同的 WB 增益（相机 WB 设置在 burst 内不变）
-        r_gain = (1.0 - delta) + (2.0 * delta) * torch.rand(1).item()
-        b_gain = (1.0 - delta) + (2.0 * delta) * torch.rand(1).item()
-
-        gains = torch.ones((1, 4, 1, 1), dtype=inputs.dtype, device=inputs.device)
-        gains[0, 0, 0, 0] = r_gain  # R channel (index 0)
-        gains[0, 3, 0, 0] = b_gain  # B channel (index 3)
-
-        return inputs * gains  # broadcast (1,4,1,1) -> (9,4,H,W)
-
     def __call__(self, inputs: torch.Tensor, target: torch.Tensor):
         if not self.enable:
             return inputs, target
@@ -156,16 +99,6 @@ class HDRBurstAugment:
         if self.geo_enable:
             geom = self._sample_geom()
             inputs, target = self._apply_geom(inputs, target, geom)
-
-        if self.exp_enable:
-            inputs, target = self._apply_exposure_jitter(inputs, target)
-
-        if self.wb_enable:
-            inputs = self._apply_wb_jitter(inputs)
-
-        if self.noise_enable:
-            noise = torch.randn_like(inputs) * self.noise_std
-            inputs = inputs + noise
 
         if self.clamp:
             inputs = inputs.clamp(0.0, 1.0)
@@ -190,16 +123,6 @@ class HDRBurstAugment:
             if geom is None:
                 geom = self._sample_geom()
             inputs, target = self._apply_geom(inputs, target, geom)
-
-        if self.exp_enable:
-            inputs, target = self._apply_exposure_jitter(inputs, target)
-
-        if self.wb_enable:
-            inputs = self._apply_wb_jitter(inputs)
-
-        if self.noise_enable:
-            noise = torch.randn_like(inputs) * self.noise_std
-            inputs = inputs + noise
 
         if self.clamp:
             inputs = inputs.clamp(0.0, 1.0)

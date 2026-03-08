@@ -57,18 +57,6 @@ def train(
     aug_geo_enable=False,
     aug_geo_flip_enable=True,
     aug_geo_rot90_enable=True,
-    aug_exp_enable=False,
-    aug_exp_low_min=0.9,
-    aug_exp_low_max=1.1,
-    aug_exp_mid_min=0.9,
-    aug_exp_mid_max=1.1,
-    aug_exp_high_min=0.9,
-    aug_exp_high_max=1.1,
-    aug_exp_global=False,
-    aug_wb_enable=False,
-    aug_wb_gain_delta=0.05,
-    aug_noise_enable=False,
-    aug_noise_std=0.0,
     pretrained_path=None,
     loss_name='mulaw_l1',
     ema_enable=False,
@@ -111,15 +99,6 @@ def train(
         geo_enable=aug_geo_enable,
         geo_flip_enable=aug_geo_flip_enable,
         geo_rot90_enable=aug_geo_rot90_enable,
-        exp_enable=aug_exp_enable,
-        exp_range_low=(aug_exp_low_min, aug_exp_low_max),
-        exp_range_mid=(aug_exp_mid_min, aug_exp_mid_max),
-        exp_range_high=(aug_exp_high_min, aug_exp_high_max),
-        exp_global=aug_exp_global,
-        wb_enable=aug_wb_enable,
-        wb_gain_delta=aug_wb_gain_delta,
-        noise_enable=aug_noise_enable,
-        noise_std=aug_noise_std,
         clamp=True,
     )
     use_progressive_crop = bool(aug_enable and aug_crop_enable and aug_progressive_crop_enable and aug_progressive_crop_schedule)
@@ -169,9 +148,9 @@ def train(
     )
     val_loader = torch.utils.data.DataLoader(
         val_set,
-        batch_size=4,
+        batch_size=1,
         shuffle=False,
-        num_workers=4,
+        num_workers=1,
         pin_memory=cuda,
         persistent_workers=True,
     )
@@ -230,12 +209,7 @@ def train(
         )
     print(
         f"=> Augment: enable={aug_enable}, crop={aug_crop_enable}({crop_desc}, even={aug_crop_even_offset}), "
-        f"geo={aug_geo_enable}(flip={aug_geo_flip_enable}, rot90={aug_geo_rot90_enable}), "
-        f"exp={aug_exp_enable}(low={aug_exp_low_min}-{aug_exp_low_max}, "
-        f"mid={aug_exp_mid_min}-{aug_exp_mid_max}, high={aug_exp_high_min}-{aug_exp_high_max}, "
-        f"global={aug_exp_global}), "
-        f"wb={aug_wb_enable}(delta={aug_wb_gain_delta}), "
-        f"noise={aug_noise_enable}(std={aug_noise_std})"
+        f"geo={aug_geo_enable}(flip={aug_geo_flip_enable}, rot90={aug_geo_rot90_enable})"
     )
     print(f"=> Train batch: {batch_desc}")
 
@@ -289,29 +263,29 @@ def train(
             )
 
         # 基于 val PSNR 判断 is_best（而非 train loss，避免增广实验偏置）
-        # if val_psnr > best_psnr:
-        #     is_best = True
-        #     best_psnr = val_psnr
-        # else:
-        #     is_best = False
+        if val_psnr > best_psnr:
+            is_best = True
+            best_psnr = val_psnr
+        else:
+            is_best = False
 
-        # if epoch % 5 == 0 or is_best:
-        #     save_dict = {
-        #         'epoch': epoch + 1,
-        #         'global_iter': global_step,
-        #         'state_dict': model.state_dict(),
-        #         'best_psnr': best_psnr,
-        #         'optimizer': optimizer.state_dict(),
-        #         'lr_scheduler': scheduler.state_dict(),
-        #         'log_path': log_txt_path,
-        #     }
-        #     if use_amp:
-        #         save_dict['scaler'] = scaler.state_dict()
-        #     if ema is not None:
-        #         save_dict['ema'] = ema.state_dict()
-        #     save_checkpoint(
-        #         save_dict, is_best, checkpoint_dir, global_step, max_keep=5
-        #     )
+        if epoch % 5 == 0 or is_best:
+            save_dict = {
+                'epoch': epoch + 1,
+                'global_iter': global_step,
+                'state_dict': model.state_dict(),
+                'best_psnr': best_psnr,
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': scheduler.state_dict(),
+                'log_path': log_txt_path,
+            }
+            if use_amp:
+                save_dict['scaler'] = scaler.state_dict()
+            if ema is not None:
+                save_dict['ema'] = ema.state_dict()
+            save_checkpoint(
+                save_dict, is_best, checkpoint_dir, global_step, max_keep=5
+            )
 
         # decay the learning rate
         scheduler.step()
@@ -328,7 +302,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--lr_decay', type=float, default=0.95)
-    parser.add_argument('--num_threads', type=int, default=4)
+    parser.add_argument('--num_threads', type=int, default=1)
     parser.add_argument('--cuda', type=int, default=1)
     parser.add_argument('--mgpu', type=int, default=1)
     parser.add_argument('--restart_train', type=int, default=1)
@@ -356,18 +330,6 @@ if __name__ == '__main__':
     parser.add_argument('--aug_geo_enable', type=int, default=0)
     parser.add_argument('--aug_geo_flip_enable', type=int, default=1)
     parser.add_argument('--aug_geo_rot90_enable', type=int, default=1)
-    parser.add_argument('--aug_exp_enable', type=int, default=0)
-    parser.add_argument('--aug_exp_low_min', type=float, default=0.9)
-    parser.add_argument('--aug_exp_low_max', type=float, default=1.1)
-    parser.add_argument('--aug_exp_mid_min', type=float, default=0.9)
-    parser.add_argument('--aug_exp_mid_max', type=float, default=1.1)
-    parser.add_argument('--aug_exp_high_min', type=float, default=0.9)
-    parser.add_argument('--aug_exp_high_max', type=float, default=1.1)
-    parser.add_argument('--aug_exp_global', type=int, default=0)
-    parser.add_argument('--aug_wb_enable', type=int, default=0)
-    parser.add_argument('--aug_wb_gain_delta', type=float, default=0.05)
-    parser.add_argument('--aug_noise_enable', type=int, default=0)
-    parser.add_argument('--aug_noise_std', type=float, default=0.0)
 
     # EMA
     parser.add_argument('--ema', type=int, default=0, help='Enable EMA weight averaging (0/1)')
@@ -400,18 +362,6 @@ if __name__ == '__main__':
         aug_geo_enable=bool(args.aug_geo_enable),
         aug_geo_flip_enable=bool(args.aug_geo_flip_enable),
         aug_geo_rot90_enable=bool(args.aug_geo_rot90_enable),
-        aug_exp_enable=bool(args.aug_exp_enable),
-        aug_exp_low_min=args.aug_exp_low_min,
-        aug_exp_low_max=args.aug_exp_low_max,
-        aug_exp_mid_min=args.aug_exp_mid_min,
-        aug_exp_mid_max=args.aug_exp_mid_max,
-        aug_exp_high_min=args.aug_exp_high_min,
-        aug_exp_high_max=args.aug_exp_high_max,
-        aug_exp_global=bool(args.aug_exp_global),
-        aug_wb_enable=bool(args.aug_wb_enable),
-        aug_wb_gain_delta=args.aug_wb_gain_delta,
-        aug_noise_enable=bool(args.aug_noise_enable),
-        aug_noise_std=args.aug_noise_std,
         pretrained_path=args.pretrained,
         loss_name=args.loss,
         ema_enable=bool(args.ema),

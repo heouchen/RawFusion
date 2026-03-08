@@ -72,11 +72,11 @@ def train_one_epoch(model, data_loader, optimizer, scaler, use_amp, cuda,
 
 
 def validate(model, val_loader, use_amp, cuda):
-    """验证循环，返回 (psnr, ssim)"""
+    """验证循环，返回 (psnr, ssim)。按样本数加权聚合，保证任意 batch_size 下与逐图平均同口径。"""
     model.eval()
     val_psnr_sum = 0.0
     val_ssim_sum = 0.0
-    val_count = 0
+    val_n_samples = 0
 
     with torch.no_grad():
         val_pbar = tqdm(val_loader, desc='Validation', ncols=100, leave=False)
@@ -92,11 +92,13 @@ def validate(model, val_loader, use_amp, cuda):
             with torch.amp.autocast('cuda', enabled=use_amp):
                 pred = model(burst_noise)
                 pred = torch.clamp(pred, 0.0, 1.0)
-            val_psnr_sum += calculate_psnr(pred.unsqueeze(1), gt.unsqueeze(1))
-            val_ssim_sum += calculate_ssim(pred.unsqueeze(1), gt.unsqueeze(1))
-            val_count += 1
+            batch_psnr = calculate_psnr(pred.unsqueeze(1), gt.unsqueeze(1))
+            batch_ssim = calculate_ssim(pred.unsqueeze(1), gt.unsqueeze(1))
+            val_psnr_sum += batch_psnr * b
+            val_ssim_sum += batch_ssim * b
+            val_n_samples += b
         val_pbar.close()
 
-    val_psnr = val_psnr_sum / val_count if val_count > 0 else 0.0
-    val_ssim = val_ssim_sum / val_count if val_count > 0 else 0.0
+    val_psnr = val_psnr_sum / val_n_samples if val_n_samples > 0 else 0.0
+    val_ssim = val_ssim_sum / val_n_samples if val_n_samples > 0 else 0.0
     return val_psnr, val_ssim

@@ -68,9 +68,6 @@ run_one () {
     --aug_geo_enable 1 \
     --aug_geo_flip_enable 1 \
     --aug_geo_rot90_enable 1 \
-    --aug_exp_enable 0 \
-    --aug_wb_enable 0 \
-    --aug_noise_enable 0 \
     --ema "${EMA_ENABLE}"
 }
 run_one "safnet_claude_27_v2" "model_cmp_claude27_v2_1"
