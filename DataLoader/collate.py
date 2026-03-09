@@ -130,9 +130,10 @@ class CropScheduleController:
         return "fixed", ""
 
 
-def make_train_collate(augment: HDRBurstAugment, crop_sizes, batch_geom=False, crop_controller: CropScheduleController = None):
+def make_train_collate(augment: HDRBurstAugment, crop_sizes, batch_geom=False, crop_controller: CropScheduleController = None, consist_enable=False, consist_sizes=None):
     """
     Batch-level multi-scale crop: ensure same HxW within a batch.
+    Optionally returns consistency crops if consist_enable is True.
     """
     def _collate(batch):
         # batch: List[(inputs, target)]
@@ -171,6 +172,40 @@ def make_train_collate(augment: HDRBurstAugment, crop_sizes, batch_geom=False, c
 
         inputs = torch.stack([a[0] for a in augmented], dim=0)
         targets = torch.stack([a[1] for a in augmented], dim=0)
+
+        # Generate consistency crops if enabled
+        if consist_enable and consist_sizes:
+            consist_inputs_list = []
+            consist_bboxes_list = []
+            c_geom = None
+            for c_size in consist_sizes:
+                c_ch, c_cw = c_size
+                batch_c_inputs = []
+                batch_c_bboxes = []
+                for b_idx in range(len(batch)):
+                    # Get the augmented full-size (or current scaled) input
+                    inp_b = inputs[b_idx]
+                    tgt_b = targets[b_idx]
+                    _, _, h, w = inp_b.shape
+                    if c_ch <= 0 or c_cw <= 0 or c_ch > h or c_cw > w:
+                        batch_c_inputs.append(inp_b)
+                        batch_c_bboxes.append(torch.tensor([0, 0, h, w]))
+                        continue
+
+                    max_y = h - c_ch
+                    max_x = w - c_cw
+                    y = int(torch.randint(0, max_y + 1, (1,)).item()) if max_y > 0 else 0
+                    x = int(torch.randint(0, max_x + 1, (1,)).item()) if max_x > 0 else 0
+
+                    c_inp = inp_b[:, :, y : y + c_ch, x : x + c_cw]
+                    batch_c_inputs.append(c_inp)
+                    batch_c_bboxes.append(torch.tensor([y, x, c_ch, c_cw]))
+                
+                consist_inputs_list.append(torch.stack(batch_c_inputs, dim=0))
+                consist_bboxes_list.append(torch.stack(batch_c_bboxes, dim=0))
+            return inputs, targets, consist_inputs_list, consist_bboxes_list
+
         return inputs, targets
 
     return _collate
+

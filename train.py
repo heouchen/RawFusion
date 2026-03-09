@@ -61,6 +61,9 @@ def train(
     loss_name='mulaw_l1',
     ema_enable=False,
     ema_decay=0.999,
+    consist_enable=False,
+    consist_sizes=None,
+    consist_weight=0.1,
 ):
     torch.set_num_threads(num_threads)
 
@@ -135,7 +138,9 @@ def train(
                 aug_crop_sizes,
                 batch_geom=use_batch_geom,
                 crop_controller=crop_controller,
-            ) if use_batch_collate else None,
+                consist_enable=consist_enable,
+                consist_sizes=consist_sizes,
+            ) if use_batch_collate or consist_enable else None,
         )
 
     # 验证集（每个 epoch 后计算 PSNR/SSIM）
@@ -236,7 +241,7 @@ def train(
 
         avg_train_loss, step_count = train_one_epoch(
             model, data_loader, optimizer, scaler, use_amp, cuda,
-            epoch, n_epoch, output_dir, loss_fn=loss_fn, ema=ema
+            epoch, n_epoch, output_dir, loss_fn=loss_fn, ema=ema, consist_weight=consist_weight
         )
         global_step += step_count
         epoch_time = time.time() - epoch_start_time
@@ -335,6 +340,11 @@ if __name__ == '__main__':
     parser.add_argument('--ema', type=int, default=0, help='Enable EMA weight averaging (0/1)')
     parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA decay rate')
 
+    # Consistency Constraint
+    parser.add_argument('--consist_enable', type=int, default=0, help='Enable multi-scale consistency constraint')
+    parser.add_argument('--consist_sizes', type=str, default="96x192,192x384", help='Crop sizes for consistency constraint')
+    parser.add_argument('--consist_weight', type=float, default=0.1, help='Weight for consistency loss')
+
     args = parser.parse_args()
 
     train(
@@ -366,4 +376,7 @@ if __name__ == '__main__':
         loss_name=args.loss,
         ema_enable=bool(args.ema),
         ema_decay=args.ema_decay,
+        consist_enable=bool(args.consist_enable),
+        consist_sizes=parse_crop_sizes(args.consist_sizes),
+        consist_weight=args.consist_weight,
     )

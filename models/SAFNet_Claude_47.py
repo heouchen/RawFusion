@@ -1,10 +1,10 @@
 """
-SAFNet_Claude_47 — Restormer-Inspired MDTA Refinement
-======================================================
-Built on SAFNet_Claude_40. Replaces the last 2 of 5 RefineNet RepNeXtBlocks
-with RestormerBlocks (MDTA + GDFN). MDTA computes self-attention across 
-channels rather than spatial dimensions, making it efficient for high-res 
-images while capturing global interactions.
+SAFNet_Claude_47 — Deep Aligned Feature Propagation
+===================================================
+Built on SAFNet_Claude_40. Fixes the "wasted features" bottleneck:
+Extracts high-dimensional aligned features (f0_w_all, f4_1, f8_w_all) from the
+Stage-2 Adapter and propagates them directly into RefineNet. This lets RefineNet
+use the encoder's deep structural understanding instead of just warped raw RGB images.
 
 Target (fused): <= 5M params, <= 100G FLOPs for input (1, 36, 384, 768),
 which corresponds to full-size RGB output (1, 3, 768, 1536).
@@ -367,77 +367,6 @@ class RepNeXtBlock(nn.Module):
         y = self.pw2(y)
         return x + y * self.scale
 
-# ======================== Restormer Blocks (MDTA + GDFN) ========================
-class MDTA(nn.Module):
-    """Multi-Dconv Head Transposed Attention (from Restormer)"""
-    def __init__(self, channels, num_heads=2):
-        super().__init__()
-        self.num_heads = num_heads
-        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
-
-        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
-        self.qkv_dwconv = nn.Conv2d(channels * 3, channels * 3, kernel_size=3, stride=1, padding=1, groups=channels * 3, bias=False)
-        self.project_out = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-
-    def forward(self, x):
-        b, c, h, w = x.shape
-
-        qkv = self.qkv_dwconv(self.qkv(x))
-        q, k, v = qkv.chunk(3, dim=1)
-
-        q = q.reshape(b, self.num_heads, c // self.num_heads, h * w)
-        k = k.reshape(b, self.num_heads, c // self.num_heads, h * w)
-        v = v.reshape(b, self.num_heads, c // self.num_heads, h * w)
-
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
-
-        attn = (q @ k.transpose(-2, -1)) * self.temperature
-        attn = attn.softmax(dim=-1)
-
-        out = (attn @ v)
-        out = out.reshape(b, c, h, w)
-
-        out = self.project_out(out)
-        return out
-
-
-class GDFN(nn.Module):
-    """Gated-Dconv Feed-Forward Network (from Restormer)"""
-    def __init__(self, channels, expansion_factor=2.66):
-        super().__init__()
-        hidden_features = int(channels * expansion_factor)
-        
-        self.project_in = nn.Conv2d(channels, hidden_features * 2, kernel_size=1, bias=False)
-        self.dwconv = nn.Conv2d(hidden_features * 2, hidden_features * 2, kernel_size=3, stride=1, padding=1, groups=hidden_features * 2, bias=False)
-        self.project_out = nn.Conv2d(hidden_features, channels, kernel_size=1, bias=False)
-
-    def forward(self, x):
-        x = self.project_in(x)
-        x1, x2 = self.dwconv(x).chunk(2, dim=1)
-        x = F.gelu(x1) * x2
-        x = self.project_out(x)
-        return x
-
-
-class RestormerBlock(nn.Module):
-    def __init__(self, channels, internal_channels=64, num_heads=2, expansion_factor=1.2):
-        super().__init__()
-        self.compress = nn.Conv2d(channels, internal_channels, 1, bias=False)
-        self.norm1 = nn.GroupNorm(1, internal_channels)
-        self.attn = MDTA(internal_channels, num_heads)
-        self.norm2 = nn.GroupNorm(1, internal_channels)
-        self.ffn = GDFN(internal_channels, expansion_factor)
-        self.expand = nn.Conv2d(internal_channels, channels, 1, bias=False)
-        self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
-
-    def forward(self, x):
-        h = self.compress(x)
-        h = h + self.attn(self.norm1(h))
-        h = h + self.ffn(self.norm2(h))
-        h = self.expand(h)
-        return x + h * self.scale
-
 # ======================== Encoder ========================
 class Encoder(nn.Module):
     def __init__(self, in_channels=4):
@@ -646,15 +575,16 @@ class ReliableMerge3Frame(nn.Module):
         return torch.clamp(merged + residual, 0, 1)
 
 # ======================== RefineNet ========================
-class RefineNetMDTA(nn.Module):
-    def __init__(self, img_channels=4):
+class RefineNet(nn.Module):
+    def __init__(self, img_channels=4, deep_feat_channels=24):
         super().__init__()
         c0, c1, c2 = 24, 52, 24
         total_c = c0 + c1 + c2
 
         self.conv0 = nn.Sequential(convrelu(img_channels, c0), RepNeXtBlock(c0))
+        in_c1 = img_channels + 2 + 2 + 1 + 1 + 3 + deep_feat_channels
         self.conv1 = nn.Sequential(
-            DeformConvRelu(img_channels + 2 + 2 + 1 + 1 + 3, c1),
+            DeformConvRelu(in_c1, c1),
             RepNeXtBlock(c1)
         )
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), RepNeXtBlock(c2))
@@ -664,17 +594,17 @@ class RefineNetMDTA(nn.Module):
             RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.0),
             RepNeXtBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=2.0),
             RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.0),
-            RestormerBlock(total_c, num_heads=2, expansion_factor=1.2),
+            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2.0),
         )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
         self.pixel_shuffle = nn.PixelShuffle(2)
 
-    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
+    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m, deep_feat):
         feat0 = self.conv0(img0_c)
         feat1 = self.conv1(torch.cat([
             img4_c, flow0 / div_flow, flow8 / div_flow,
-            mask0, mask8, img_hdr_m], 1))
+            mask0, mask8, img_hdr_m, deep_feat], 1))
         feat2 = self.conv2(img8_c)
 
         feat0_warp = warp(feat0, flow0)
@@ -723,13 +653,13 @@ class HighResRefineTail(nn.Module):
         return self.out_proj(feat)
 
 
-class RefineNetMDTAPlus(RefineNetMDTA):
-    def __init__(self, img_channels=4):
-        super().__init__(img_channels=img_channels)
+class RefineNetPlus(RefineNet):
+    def __init__(self, img_channels=4, deep_feat_channels=24):
+        super().__init__(img_channels=img_channels, deep_feat_channels=deep_feat_channels)
         self.tail = HighResRefineTail(hidden_channels=12)
 
-    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
-        out = super().forward(img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m)
+    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m, deep_feat):
+        out = super().forward(img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m, deep_feat)
         out = out + 0.10 * self.tail(out)
         return torch.clamp(out, 0, 1)
 
@@ -750,7 +680,11 @@ class SAFNet_Claude_47(nn.Module):
         self.adapter_l4 = FlowFeatureAdapter(48)
         self.merge_stem = MergeFeatureStem(4, 6)
         self.learned_merge = ReliableMerge3Frame(feat_channels=6, hidden_channels=36)
-        self.refinenet = RefineNetMDTAPlus()
+        self.deep_feat_proj = nn.Sequential(
+            nn.Conv2d(48 * 3, 24, 1, 1, 0, bias=True),
+            nn.PReLU(24)
+        )
+        self.refinenet = RefineNetPlus(deep_feat_channels=24)
 
     def fuse_reparam(self):
         for m in self.modules():
@@ -836,12 +770,12 @@ class SAFNet_Claude_47(nn.Module):
             up_rmask0_1 = F.interpolate(up_rmask0_1, size=org_size, mode='bilinear', align_corners=False)
             up_rmask8_1 = F.interpolate(up_rmask8_1, size=org_size, mode='bilinear', align_corners=False)
 
-        return torch.sigmoid(up_rmask0_1), torch.sigmoid(up_rmask8_1), final_flow0, final_flow8
+        return torch.sigmoid(up_rmask0_1), torch.sigmoid(up_rmask8_1), final_flow0, final_flow8, f0w_1, f4_1, f8w_1
 
     def forward(self, x, scale_factor=0.5, refine=True):
         img0_c, img4_c, img8_c = self.group_preparer(x)
 
-        mask0, mask8, flow0, flow8 = self.forward_flow_mask(
+        mask0, mask8, flow0, flow8, f0w_1, f4_1, f8w_1 = self.forward_flow_mask(
             img0_c, img4_c, img8_c, scale_factor=scale_factor)
 
         img0_warp = warp(img0_c, flow0)
@@ -855,9 +789,12 @@ class SAFNet_Claude_47(nn.Module):
             mask0, mask8, flow0, flow8,
             merge_feat0, merge_feat4, merge_feat8)
 
+        deep_feat = self.deep_feat_proj(torch.cat([f0w_1, f4_1, f8w_1], dim=1))
+        deep_feat = F.interpolate(deep_feat, size=img0_c.shape[-2:], mode="bilinear", align_corners=False)
+
         if refine:
             return self.refinenet(img0_c, img4_c, img8_c,
-                                  flow0, flow8, mask0, mask8, img_hdr_m)
+                                  flow0, flow8, mask0, mask8, img_hdr_m, deep_feat)
         else:
             return F.interpolate(img_hdr_m, scale_factor=2,
                                  mode="bilinear", align_corners=False)

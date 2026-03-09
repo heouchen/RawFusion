@@ -64,6 +64,11 @@ PROGRESSIVE_BATCH_SIZES="${PROGRESSIVE_BATCH_SIZES:-96x192@16,192x384@8,384x768@
 # 固定损失函数
 LOSS="mse"
 
+# 一致性约束
+CONSIST_ENABLE="${CONSIST_ENABLE:-0}"
+CONSIST_SIZES="${CONSIST_SIZES:-96x192,192x384,384x768}"
+CONSIST_WEIGHT="${CONSIST_WEIGHT:-0.1}"
+
 mkdir -p output_log
 EMA_ENABLE="0"
 pretrained=""
@@ -73,6 +78,7 @@ pretrained=""
 # echo "3小时后继续执行..."
 
 run_one () {
+
   local model_name="$1"
   local exp_name="$2"
   local ts
@@ -109,7 +115,10 @@ run_one () {
     --aug_geo_flip_enable 1 \
     --aug_geo_rot90_enable 1 \
     --ema "${EMA_ENABLE}" \
-    --pretrained "${pretrained}"
+    --pretrained "${pretrained}" \
+    --consist_enable "${CONSIST_ENABLE}" \
+    --consist_sizes "${CONSIST_SIZES}" \
+    --consist_weight "${CONSIST_WEIGHT}"
 }
 # Curriculum example:
 # PROGRESSIVE_CROP_ENABLE=1 \
@@ -141,9 +150,11 @@ run_one "safnet_claude_47" "model_submit_claude47"
 run_one "safnet_claude_48" "model_submit_claude48"
 run_one "safnet_claude_49" "model_submit_claude49"
 
-# LOSS="l1"
-# run_one "safnet_claude_41" "model_submit_claude41_l1"
-# LOSS="mse"
+# CONSIST_ENABLE="${CONSIST_ENABLE:-1}" \
+# CROP_SIZES="192x384,384x768" \
+# CONSIST_SIZES="192x384" \
+# CONSIST_WEIGHT="1" \
+# run_one "safnet_claude_40" "model_submit_claude40_consist"
 
 # PROGRESSIVE_CROP_ENABLE=1 \
 # PROGRESSIVE_CROP_SCHEDULE="96x192@0.3,192x384@0.7,384x768@1.0" \

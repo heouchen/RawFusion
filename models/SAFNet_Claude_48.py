@@ -1,10 +1,11 @@
 """
-SAFNet_Claude_48 — CBAM Spatial & Channel Attention
-===================================================
-Built on SAFNet_Claude_40. Upgrades the standard Squeeze-and-Excitation (SE)
-module in all RepNeXtBlocks to a CBAM (Convolutional Block Attention Module)
-that employs both Channel Attention and Spatial Attention. This allows the
-network to better focus on *where* to refine HDR details.
+SAFNet_Claude_48 — NAFBlock (Nonlinear-Activation-Free) Refinement
+==================================================================
+Built on SAFNet_Claude_40. Fixes the "destructive spatial gating" bottleneck:
+Standard explicitly gated attention (CBAM/SE) with GELU/Sigmoid destroys high frequencies.
+We replace RepNeXtBlock in RefineNet with a highly optimized NAFBlock 
+(SimpleGate + Simplified Channel Attention). This allows us to drastically expand 
+the internal feature width while remaining extremely efficient.
 
 Target (fused): <= 5M params, <= 100G FLOPs for input (1, 36, 384, 768),
 which corresponds to full-size RGB output (1, 3, 768, 1536).
@@ -333,52 +334,7 @@ class ChunkConvV4(nn.Module):
         x0, x1, x2, x3 = x[:, :g], x[:, g:2*g], x[:, 2*g:3*g], x[:, 3*g:]
         return torch.cat([x0, self.rep3(x1), self.rep5(x2), self.rep7(x3)], dim=1)
 
-# ======================== CBAM (Channel & Spatial Attention) ========================
-class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=4):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        r = max(in_planes // ratio, 8)
-
-        self.fc1   = nn.Conv2d(in_planes, r, 1, bias=False)
-        self.relu1 = nn.GELU()
-        self.fc2   = nn.Conv2d(r, in_planes, 1, bias=False)
-
-    def forward(self, x):
-        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
-        out = avg_out + max_out
-        return torch.sigmoid(out)
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
-        padding = 3 if kernel_size == 7 else 1
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return torch.sigmoid(x)
-
-
-class CBAM(nn.Module):
-    def __init__(self, in_planes, ratio=4, kernel_size=7):
-        super(CBAM, self).__init__()
-        self.ca = ChannelAttention(in_planes, ratio)
-        self.sa = SpatialAttention(kernel_size)
-
-    def forward(self, x):
-        x = x * self.ca(x)
-        x = x * self.sa(x)
-        return x
-
-# ======================== RepNeXtBlock (with CBAM) ========================
+# ======================== RepNeXtBlock ========================
 class RepNeXtBlock(nn.Module):
     def __init__(self, channels, dilation=1, se_reduction=4, expand_ratio=2,
                  cond=False, num_experts=12):
@@ -394,8 +350,13 @@ class RepNeXtBlock(nn.Module):
             self.pw2 = nn.Conv2d(expand_ch, channels, 1, bias=True)
         self.dw = ChunkConvV4(expand_ch, dilation=dilation)
         self.act = nn.GELU()
-        
-        self.attn = CBAM(expand_ch, ratio=se_reduction, kernel_size=7)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(expand_ch, se_ch, 1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(se_ch, expand_ch, 1, bias=True),
+            nn.Sigmoid()
+        )
         self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
 
     def forward(self, x):
@@ -403,7 +364,7 @@ class RepNeXtBlock(nn.Module):
         y = self.pw1(y)
         y = self.dw(y)
         y = self.act(y)
-        y = self.attn(y)
+        y = y * self.se(y)
         y = self.pw2(y)
         return x + y * self.scale
 
@@ -614,6 +575,46 @@ class ReliableMerge3Frame(nn.Module):
         residual = 0.10 * torch.tanh(self.residual_head(feat))
         return torch.clamp(merged + residual, 0, 1)
 
+# ======================== NAFBlockChunkV4 ========================
+class NAFBlockChunkV4(nn.Module):
+    def __init__(self, channels, dilation=1, expand_ratio=3.0, cond=False, num_experts=10):
+        super().__init__()
+        expand_ch = int(np.ceil((channels * float(expand_ratio)) / 4.0) * 4)
+        
+        self.norm = nn.GroupNorm(1, channels)
+        if cond:
+            self.pw1 = CondConv2d_1x1(channels, expand_ch, num_experts)
+            self.pw2 = CondConv2d_1x1(expand_ch // 2, channels, num_experts)
+        else:
+            self.pw1 = nn.Conv2d(channels, expand_ch, 1, bias=True)
+            self.pw2 = nn.Conv2d(expand_ch // 2, channels, 1, bias=True)
+            
+        self.dw = ChunkConvV4(expand_ch, dilation=dilation)
+        
+        half_ch = expand_ch // 2
+        self.sca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(half_ch, half_ch, 1, bias=True)
+        )
+        self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
+
+    def forward(self, x):
+        identity = x
+        y = self.norm(x)
+        y = self.pw1(y)
+        y = self.dw(y)
+        
+        # SimpleGate
+        y1, y2 = y.chunk(2, dim=1)
+        y = y1 * y2
+        
+        # Simplified Channel Attention
+        y_sca = self.sca(y)
+        y = y * y_sca
+        
+        y = self.pw2(y)
+        return identity + y * self.scale
+
 # ======================== RefineNet ========================
 class RefineNet(nn.Module):
     def __init__(self, img_channels=4):
@@ -621,19 +622,19 @@ class RefineNet(nn.Module):
         c0, c1, c2 = 24, 52, 24
         total_c = c0 + c1 + c2
 
-        self.conv0 = nn.Sequential(convrelu(img_channels, c0), RepNeXtBlock(c0))
+        self.conv0 = nn.Sequential(convrelu(img_channels, c0), NAFBlockChunkV4(c0, expand_ratio=2.5))
         self.conv1 = nn.Sequential(
             DeformConvRelu(img_channels + 2 + 2 + 1 + 1 + 3, c1),
-            RepNeXtBlock(c1)
+            NAFBlockChunkV4(c1, expand_ratio=2.5)
         )
-        self.conv2 = nn.Sequential(convrelu(img_channels, c2), RepNeXtBlock(c2))
+        self.conv2 = nn.Sequential(convrelu(img_channels, c2), NAFBlockChunkV4(c2, expand_ratio=2.5))
 
         self.blocks = nn.Sequential(
-            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2.0),
-            RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.0),
-            RepNeXtBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=2.0),
-            RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.0),
-            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2.0),
+            NAFBlockChunkV4(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2.5),
+            NAFBlockChunkV4(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.5),
+            NAFBlockChunkV4(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=2.5),
+            NAFBlockChunkV4(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.5),
+            NAFBlockChunkV4(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2.5),
         )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)

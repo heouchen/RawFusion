@@ -1,10 +1,11 @@
 """
-SAFNet_Claude_49 — Deep Feature Merge Bypass
-============================================
-Built on SAFNet_Claude_40. Modifies ReliableMerge3Frame to output not just the 
-merged RGB image, but also a deeply merged feature map (from the L1 feature representations). 
-This feature map bypasses the RGB bottleneck and is concatenated directly into RefineNet
-to preserve richer detail information.
+SAFNet_Claude_49 — Star-Operation (StarNet) Refinement
+======================================================
+Built on SAFNet_Claude_40. Fixes the "lack of high-dimensional non-linear interactions"
+bottleneck. Replaces RepNeXtBlock in RefineNet with StarRefineBlock. 
+StarRefineBlock expands channels massively, applies DW convolution on half of the 
+channels, and element-wise multiplies them for extreme implicit dimensionality and 
+non-linear expressivity at negligible computation.
 
 Target (fused): <= 5M params, <= 100G FLOPs for input (1, 36, 384, 768),
 which corresponds to full-size RGB output (1, 3, 768, 1536).
@@ -572,40 +573,73 @@ class ReliableMerge3Frame(nn.Module):
                   weights[:, 1:2] * img4 +
                   weights[:, 2:3] * img8_w)
         residual = 0.10 * torch.tanh(self.residual_head(feat))
-        return torch.clamp(merged + residual, 0, 1), feat # Return merged_img and merged_feat
+        return torch.clamp(merged + residual, 0, 1)
+
+# ======================== StarRefineBlock ========================
+class StarRefineBlock(nn.Module):
+    def __init__(self, channels, dilation=1, expand_ratio=4.0, cond=True, num_experts=10):
+        super().__init__()
+        # Ensure expand_ch is divisible by 8 so half_ch is divisible by 4 for ChunkConvV4
+        expand_ch = int(np.ceil((channels * float(expand_ratio)) / 8.0) * 8)
+        
+        self.norm = nn.GroupNorm(1, channels)
+        if cond:
+            self.pw1 = CondConv2d_1x1(channels, expand_ch, num_experts)
+            self.pw2 = CondConv2d_1x1(expand_ch // 2, channels, num_experts)
+        else:
+            self.pw1 = nn.Conv2d(channels, expand_ch, 1, bias=True)
+            self.pw2 = nn.Conv2d(expand_ch // 2, channels, 1, bias=True)
+            
+        half_ch = expand_ch // 2
+        
+        # DW Conv using ChunkConvV4 on half the channels
+        self.dw = ChunkConvV4(half_ch, dilation=dilation)
+        
+        self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
+
+    def forward(self, x):
+        identity = x
+        y = self.norm(x)
+        y = self.pw1(y)
+        
+        # Star Operation: split, process half, multiply
+        y1, y2 = y.chunk(2, dim=1)
+        y1 = self.dw(y1)
+        y = y1 * y2
+        
+        y = self.pw2(y)
+        return identity + y * self.scale
 
 # ======================== RefineNet ========================
 class RefineNet(nn.Module):
-    def __init__(self, img_channels=4, merged_feat_channels=6): # Added merged_feat_channels
+    def __init__(self, img_channels=4):
         super().__init__()
         c0, c1, c2 = 24, 52, 24
         total_c = c0 + c1 + c2
 
-        self.conv0 = nn.Sequential(convrelu(img_channels, c0), RepNeXtBlock(c0))
-        # Add merged_feat_channels to conv1 input
-        in_c1 = img_channels + 2 + 2 + 1 + 1 + 3 + merged_feat_channels
+        self.conv0 = nn.Sequential(convrelu(img_channels, c0), StarRefineBlock(c0, expand_ratio=4.0, cond=False))
         self.conv1 = nn.Sequential(
-            DeformConvRelu(in_c1, c1),
-            RepNeXtBlock(c1)
+            DeformConvRelu(img_channels + 2 + 2 + 1 + 1 + 3, c1),
+            StarRefineBlock(c1, expand_ratio=4.0, cond=False)
         )
-        self.conv2 = nn.Sequential(convrelu(img_channels, c2), RepNeXtBlock(c2))
+        self.conv2 = nn.Sequential(convrelu(img_channels, c2), StarRefineBlock(c2, expand_ratio=4.0, cond=False))
 
         self.blocks = nn.Sequential(
-            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2.0),
-            RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.0),
-            RepNeXtBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=2.0),
-            RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.0),
-            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2.0),
+            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=4.0),
+            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=4.0),
+            StarRefineBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=4.0),
+            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=4.0),
+            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=4.0),
         )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
         self.pixel_shuffle = nn.PixelShuffle(2)
 
-    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m, merged_feat): # Added merged_feat
+    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
         feat0 = self.conv0(img0_c)
         feat1 = self.conv1(torch.cat([
             img4_c, flow0 / div_flow, flow8 / div_flow,
-            mask0, mask8, img_hdr_m, merged_feat], 1)) # Concatenated merged_feat
+            mask0, mask8, img_hdr_m], 1))
         feat2 = self.conv2(img8_c)
 
         feat0_warp = warp(feat0, flow0)
@@ -654,13 +688,13 @@ class HighResRefineTail(nn.Module):
         return self.out_proj(feat)
 
 
-class RefineNetPlusTail(RefineNet): # Inherits from RefineNet
-    def __init__(self, img_channels=4, merged_feat_channels=6):
-        super().__init__(img_channels=img_channels, merged_feat_channels=merged_feat_channels)
+class RefineNetPlus(RefineNet):
+    def __init__(self, img_channels=4):
+        super().__init__(img_channels=img_channels)
         self.tail = HighResRefineTail(hidden_channels=12)
 
-    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m, merged_feat):
-        out = super().forward(img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m, merged_feat)
+    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
+        out = super().forward(img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m)
         out = out + 0.10 * self.tail(out)
         return torch.clamp(out, 0, 1)
 
@@ -680,8 +714,8 @@ class SAFNet_Claude_49(nn.Module):
         self.adapter_l3 = FlowFeatureAdapter(48)
         self.adapter_l4 = FlowFeatureAdapter(48)
         self.merge_stem = MergeFeatureStem(4, 6)
-        self.learned_merge = ReliableMerge3Frame(feat_channels=6, hidden_channels=36) # Changed from ReliableMerge3FrameBypass
-        self.refinenet = RefineNetPlusTail(merged_feat_channels=36) # Updated merged_feat_channels to 36 (hidden_channels from ReliableMerge3Frame)
+        self.learned_merge = ReliableMerge3Frame(feat_channels=6, hidden_channels=36)
+        self.refinenet = RefineNetPlus()
 
     def fuse_reparam(self):
         for m in self.modules():
@@ -781,14 +815,14 @@ class SAFNet_Claude_49(nn.Module):
         merge_feat4 = self.merge_stem(img4_c)
         merge_feat8 = warp(self.merge_stem(img8_c), flow8)
 
-        img_hdr_m, merged_deep_feat = self.learned_merge( # Capture merged_deep_feat
+        img_hdr_m = self.learned_merge(
             img0_warp[:, :3], img4_c[:, :3], img8_warp[:, :3],
             mask0, mask8, flow0, flow8,
             merge_feat0, merge_feat4, merge_feat8)
 
         if refine:
             return self.refinenet(img0_c, img4_c, img8_c,
-                                  flow0, flow8, mask0, mask8, img_hdr_m, merged_deep_feat) # Pass merged_deep_feat
+                                  flow0, flow8, mask0, mask8, img_hdr_m)
         else:
             return F.interpolate(img_hdr_m, scale_factor=2,
                                  mode="bilinear", align_corners=False)
