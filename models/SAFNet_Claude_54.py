@@ -1,14 +1,11 @@
 """
-SAFNet_Claude_49 — Star-Operation (StarNet) Refinement
-======================================================
-Built on SAFNet_Claude_40. Fixes the "lack of high-dimensional non-linear interactions"
-bottleneck. Replaces RepNeXtBlock in RefineNet with StarRefineBlock. 
-StarRefineBlock expands channels massively, applies DW convolution on half of the 
-channels, and element-wise multiplies them for extreme implicit dimensionality and 
-non-linear expressivity at negligible computation.
-
-Target (fused): <= 5M params, <= 100G FLOPs for input (1, 36, 384, 768),
-which corresponds to full-size RGB output (1, 3, 768, 1536).
+SAFNet_Claude_54 — Mixture-of-Refine Experts
+============================================
+Built on SAFNet_Claude_49. Keeps the strong Claude_40/49 front-end fixed and replaces
+two key reconstruction blocks with a routed expert mixture:
+1. RepNeXt expert for stable structure recovery.
+2. Star expert for high-order nonlinear interaction.
+3. SimpleGate expert for lightweight texture repair.
 """
 import numpy as np
 import math
@@ -611,25 +608,87 @@ class StarRefineBlock(nn.Module):
         return identity + y * self.scale
 
 # ======================== RefineNet ========================
+class SimpleGateExpertBlock(nn.Module):
+    def __init__(self, channels, dilation=1, expand_ratio=2.0):
+        super().__init__()
+        expand_ch = int(np.ceil((channels * float(expand_ratio)) / 4.0) * 4)
+        self.norm = nn.GroupNorm(1, channels)
+        self.pw1 = nn.Conv2d(channels, expand_ch, 1, bias=True)
+        self.dw = ChunkConvV4(expand_ch, dilation=dilation)
+        self.sca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(expand_ch // 2, expand_ch // 2, 1, bias=True),
+        )
+        self.pw2 = nn.Conv2d(expand_ch // 2, channels, 1, bias=True)
+        self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
+
+    def forward(self, x):
+        y = self.norm(x)
+        y = self.pw1(y)
+        y = self.dw(y)
+        y1, y2 = y.chunk(2, dim=1)
+        y = y1 * y2
+        y = y * self.sca(y)
+        y = self.pw2(y)
+        return x + y * self.scale
+
+
+class RefineExpertRouter(nn.Module):
+    def __init__(self, channels, num_experts=3):
+        super().__init__()
+        self.router = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // 4, 1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(channels // 4, num_experts, 1, bias=True),
+        )
+
+    def forward(self, x):
+        weights = self.router(x).flatten(1)
+        return torch.softmax(weights, dim=1)
+
+
+class MixtureRefineBlock(nn.Module):
+    def __init__(self, channels, dilation=1, star_expand_ratio=4.0):
+        super().__init__()
+        self.router = RefineExpertRouter(channels)
+        self.expert_a = RepNeXtBlock(channels, dilation=dilation, cond=True, num_experts=10, expand_ratio=2.0)
+        self.expert_b = StarRefineBlock(
+            channels, dilation=dilation, cond=True, num_experts=10, expand_ratio=star_expand_ratio
+        )
+        self.expert_c = SimpleGateExpertBlock(channels, dilation=dilation, expand_ratio=2.0)
+
+    def forward(self, x):
+        weights = self.router(x)
+        out_a = self.expert_a(x)
+        out_b = self.expert_b(x)
+        out_c = self.expert_c(x)
+        return (
+            weights[:, 0:1, None, None] * out_a +
+            weights[:, 1:2, None, None] * out_b +
+            weights[:, 2:3, None, None] * out_c
+        )
+
+
 class RefineNet(nn.Module):
     def __init__(self, img_channels=4):
         super().__init__()
-        c0, c1, c2 = 22, 48, 22
+        c0, c1, c2 = 18, 38, 18
         total_c = c0 + c1 + c2
 
-        self.conv0 = nn.Sequential(convrelu(img_channels, c0), StarRefineBlock(c0, expand_ratio=3.55, cond=False))
+        self.conv0 = nn.Sequential(convrelu(img_channels, c0), StarRefineBlock(c0, expand_ratio=3.0, cond=False))
         self.conv1 = nn.Sequential(
             DeformConvRelu(img_channels + 2 + 2 + 1 + 1 + 3, c1),
-            StarRefineBlock(c1, expand_ratio=3.55, cond=False)
+            StarRefineBlock(c1, expand_ratio=3.0, cond=False)
         )
-        self.conv2 = nn.Sequential(convrelu(img_channels, c2), StarRefineBlock(c2, expand_ratio=3.55, cond=False))
+        self.conv2 = nn.Sequential(convrelu(img_channels, c2), StarRefineBlock(c2, expand_ratio=3.0, cond=False))
 
         self.blocks = nn.Sequential(
-            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=3.6),
+            MixtureRefineBlock(total_c, dilation=1, star_expand_ratio=4.0),
+            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.0),
+            MixtureRefineBlock(total_c, dilation=4, star_expand_ratio=4.0),
+            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.0),
+            MixtureRefineBlock(total_c, dilation=1, star_expand_ratio=4.0),
         )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
@@ -695,8 +754,8 @@ class RefineNetPlus(RefineNet):
     def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
         return super().forward(img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m)
 
-# ======================== SAFNet_Claude_49 ========================
-class SAFNet_Claude_49(nn.Module):
+# ======================== SAFNet_Claude_54 ========================
+class SAFNet_Claude_54(nn.Module):
     def __init__(self):
         super().__init__()
         self.group_preparer = ExposureGroupPreparer()
@@ -834,7 +893,7 @@ def _print_profile(height=384, width=768, params_cap_m=5.0, flops_cap_g=100.0):
     device = torch.device("cpu")  # macOS compatibility (MPS deform op is often unsupported).
     dummy = torch.ones(1, 36, height, width, device=device)
 
-    model_before = SAFNet_Claude_49().to(device).eval()
+    model_before = SAFNet_Claude_54().to(device).eval()
     model_after = copy.deepcopy(model_before).to(device).eval()
     model_after.fuse_reparam()
 

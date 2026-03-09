@@ -1,14 +1,10 @@
 """
-SAFNet_Claude_49 — Star-Operation (StarNet) Refinement
-======================================================
-Built on SAFNet_Claude_40. Fixes the "lack of high-dimensional non-linear interactions"
-bottleneck. Replaces RepNeXtBlock in RefineNet with StarRefineBlock. 
-StarRefineBlock expands channels massively, applies DW convolution on half of the 
-channels, and element-wise multiplies them for extreme implicit dimensionality and 
-non-linear expressivity at negligible computation.
-
-Target (fused): <= 5M params, <= 100G FLOPs for input (1, 36, 384, 768),
-which corresponds to full-size RGB output (1, 3, 768, 1536).
+SAFNet_Claude_53 — Latent HDR Prior Mixer
+=========================================
+Built on SAFNet_Claude_49. Keeps the proven merge/reconstruction path, then injects
+a low-resolution latent HDR prior distilled from the merged frame before refinement.
+The intent is to add global luminance organization without contaminating RefineNet
+with deeper alignment-side features.
 """
 import numpy as np
 import math
@@ -611,6 +607,47 @@ class StarRefineBlock(nn.Module):
         return identity + y * self.scale
 
 # ======================== RefineNet ========================
+class LatentMixerBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.norm = nn.GroupNorm(1, channels)
+        self.dw = nn.Conv2d(channels, channels, 5, 1, 2, groups=channels, bias=True)
+        self.pw1 = nn.Conv2d(channels, channels * 2, 1, 1, 0, bias=True)
+        self.act = nn.GELU()
+        self.pw2 = nn.Conv2d(channels * 2, channels, 1, 1, 0, bias=True)
+        self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
+
+    def forward(self, x):
+        y = self.norm(x)
+        y = self.dw(y)
+        y = self.pw1(y)
+        y = self.act(y)
+        y = self.pw2(y)
+        return x + y * self.scale
+
+
+class LatentHDRMixer(nn.Module):
+    def __init__(self, in_channels=3, hidden_channels=12):
+        super().__init__()
+        self.in_proj = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, 3, 1, 1, bias=True),
+            nn.PReLU(hidden_channels),
+        )
+        self.down = nn.Conv2d(hidden_channels, hidden_channels, 3, 2, 1, bias=True)
+        self.blocks = nn.Sequential(
+            LatentMixerBlock(hidden_channels),
+            LatentMixerBlock(hidden_channels),
+        )
+        self.out_proj = nn.Conv2d(hidden_channels, hidden_channels, 3, 1, 1, bias=True)
+
+    def forward(self, x):
+        feat = self.in_proj(x)
+        feat = self.down(feat)
+        feat = self.blocks(feat)
+        feat = F.interpolate(feat, scale_factor=2, mode="bilinear", align_corners=False)
+        return self.out_proj(feat)
+
+
 class RefineNet(nn.Module):
     def __init__(self, img_channels=4):
         super().__init__()
@@ -618,8 +655,9 @@ class RefineNet(nn.Module):
         total_c = c0 + c1 + c2
 
         self.conv0 = nn.Sequential(convrelu(img_channels, c0), StarRefineBlock(c0, expand_ratio=3.55, cond=False))
+        self.prior_mixer = LatentHDRMixer(in_channels=3, hidden_channels=12)
         self.conv1 = nn.Sequential(
-            DeformConvRelu(img_channels + 2 + 2 + 1 + 1 + 3, c1),
+            DeformConvRelu(img_channels + 2 + 2 + 1 + 1 + 3 + 12, c1),
             StarRefineBlock(c1, expand_ratio=3.55, cond=False)
         )
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), StarRefineBlock(c2, expand_ratio=3.55, cond=False))
@@ -637,9 +675,10 @@ class RefineNet(nn.Module):
 
     def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
         feat0 = self.conv0(img0_c)
+        prior = self.prior_mixer(img_hdr_m)
         feat1 = self.conv1(torch.cat([
             img4_c, flow0 / div_flow, flow8 / div_flow,
-            mask0, mask8, img_hdr_m], 1))
+            mask0, mask8, img_hdr_m, prior], 1))
         feat2 = self.conv2(img8_c)
 
         feat0_warp = warp(feat0, flow0)
@@ -695,8 +734,8 @@ class RefineNetPlus(RefineNet):
     def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
         return super().forward(img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m)
 
-# ======================== SAFNet_Claude_49 ========================
-class SAFNet_Claude_49(nn.Module):
+# ======================== SAFNet_Claude_53 ========================
+class SAFNet_Claude_53(nn.Module):
     def __init__(self):
         super().__init__()
         self.group_preparer = ExposureGroupPreparer()
@@ -834,7 +873,7 @@ def _print_profile(height=384, width=768, params_cap_m=5.0, flops_cap_g=100.0):
     device = torch.device("cpu")  # macOS compatibility (MPS deform op is often unsupported).
     dummy = torch.ones(1, 36, height, width, device=device)
 
-    model_before = SAFNet_Claude_49().to(device).eval()
+    model_before = SAFNet_Claude_53().to(device).eval()
     model_after = copy.deepcopy(model_before).to(device).eval()
     model_after.fuse_reparam()
 

@@ -1,11 +1,10 @@
 """
-SAFNet_Claude_49 — Star-Operation (StarNet) Refinement
-======================================================
-Built on SAFNet_Claude_40. Fixes the "lack of high-dimensional non-linear interactions"
-bottleneck. Replaces RepNeXtBlock in RefineNet with StarRefineBlock. 
-StarRefineBlock expands channels massively, applies DW convolution on half of the 
-channels, and element-wise multiplies them for extreme implicit dimensionality and 
-non-linear expressivity at negligible computation.
+SAFNet_Claude_51 — Remove RepDWConvL and Reallocate Budget to RefineNet
+========================================================================
+Built on Claude_49 with an explicit budget reallocation experiment:
+1. Remove RepDWConvL usage from backbone, decoder, and merge blocks.
+2. Use a no-L large-kernel path (identity | RepDWConvS | RepDWConvM | RepDWConvM).
+3. Reinvest the saved budget into a deeper and wider star-style RefineNet.
 
 Target (fused): <= 5M params, <= 100G FLOPs for input (1, 36, 384, 768),
 which corresponds to full-size RGB output (1, 3, 768, 1536).
@@ -334,6 +333,23 @@ class ChunkConvV4(nn.Module):
         x0, x1, x2, x3 = x[:, :g], x[:, g:2*g], x[:, 2*g:3*g], x[:, 3*g:]
         return torch.cat([x0, self.rep3(x1), self.rep5(x2), self.rep7(x3)], dim=1)
 
+
+class ChunkConvV3NoL(nn.Module):
+    """4-group DW mix without RepDWConvL to improve training throughput."""
+    def __init__(self, channels, dilation=1):
+        super().__init__()
+        assert channels % 4 == 0
+        g = channels // 4
+        self.g = g
+        self.rep3 = RepDWConvS(g, dilation=dilation)
+        self.rep5a = RepDWConvM(g, dilation=dilation)
+        self.rep5b = RepDWConvM(g, dilation=dilation)
+
+    def forward(self, x):
+        g = self.g
+        x0, x1, x2, x3 = x[:, :g], x[:, g:2 * g], x[:, 2 * g:3 * g], x[:, 3 * g:]
+        return torch.cat([x0, self.rep3(x1), self.rep5a(x2), self.rep5b(x3)], dim=1)
+
 # ======================== RepNeXtBlock ========================
 class RepNeXtBlock(nn.Module):
     def __init__(self, channels, dilation=1, se_reduction=4, expand_ratio=2,
@@ -368,25 +384,59 @@ class RepNeXtBlock(nn.Module):
         y = self.pw2(y)
         return x + y * self.scale
 
+
+class RepNeXtBlockNoL(nn.Module):
+    def __init__(self, channels, dilation=1, se_reduction=4, expand_ratio=2,
+                 cond=False, num_experts=12):
+        super().__init__()
+        expand_ch = int(np.ceil((channels * float(expand_ratio)) / 4.0) * 4)
+        se_ch = max(expand_ch // se_reduction, 8)
+        self.norm = nn.GroupNorm(1, channels)
+        if cond:
+            self.pw1 = CondConv2d_1x1(channels, expand_ch, num_experts)
+            self.pw2 = CondConv2d_1x1(expand_ch, channels, num_experts)
+        else:
+            self.pw1 = nn.Conv2d(channels, expand_ch, 1, bias=True)
+            self.pw2 = nn.Conv2d(expand_ch, channels, 1, bias=True)
+        self.dw = ChunkConvV3NoL(expand_ch, dilation=dilation)
+        self.act = nn.GELU()
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(expand_ch, se_ch, 1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(se_ch, expand_ch, 1, bias=True),
+            nn.Sigmoid()
+        )
+        self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
+
+    def forward(self, x):
+        y = self.norm(x)
+        y = self.pw1(y)
+        y = self.dw(y)
+        y = self.act(y)
+        y = y * self.se(y)
+        y = self.pw2(y)
+        return x + y * self.scale
+
 # ======================== Encoder ========================
 class Encoder(nn.Module):
     def __init__(self, in_channels=4):
         super().__init__()
         self.pyramid1 = nn.Sequential(
             convrelu(in_channels, 48, 3, 2, 1),
-            RepNeXtBlock(48)
+            RepNeXtBlockNoL(48)
         )
         self.pyramid2 = nn.Sequential(
             convrelu(48, 48, 3, 2, 1),
-            RepNeXtBlock(48)
+            RepNeXtBlockNoL(48)
         )
         self.pyramid3 = nn.Sequential(
             convrelu(48, 48, 3, 2, 1),
-            RepNeXtBlock(48, expand_ratio=2.25)
+            RepNeXtBlockNoL(48, expand_ratio=2.25)
         )
         self.pyramid4 = nn.Sequential(
             convrelu(48, 48, 3, 2, 1),
-            RepNeXtBlock(48, expand_ratio=2.25)
+            RepNeXtBlockNoL(48, expand_ratio=2.25)
         )
 
     def forward(self, img_c):
@@ -452,13 +502,46 @@ class DecoderDCN(nn.Module):
         up_mask2 = resize(mask2, scale_factor=2.0) + f_out[:, 5:6]
         return up_flow0, up_flow2, up_mask0, up_mask2
 
+
+class DecoderDCNNoL(nn.Module):
+    def __init__(self, mid_channels=96, num_blocks=2, cond=True,
+                 num_experts=16, expand_ratio=2.0):
+        super().__init__()
+        self.fgdcn = FlowGuidedDCN(48)
+        self.conv1 = DeformConvRelu(150, mid_channels)
+        blocks = []
+        for _ in range(num_blocks):
+            blocks.append(
+                RepNeXtBlockNoL(
+                    mid_channels,
+                    cond=cond,
+                    num_experts=num_experts,
+                    expand_ratio=expand_ratio,
+                )
+            )
+        self.blocks = nn.Sequential(*blocks)
+        self.conv_out = deconv(mid_channels, 6)
+
+    def forward(self, f0, f1, f2, flow0, flow2, mask0, mask2):
+        f0_warp = self.fgdcn(f0, flow0)
+        f2_warp = self.fgdcn(f2, flow2)
+        f_in = torch.cat([f0_warp, f1, f2_warp, flow0, flow2, mask0, mask2], 1)
+        f_out = self.conv1(f_in)
+        f_out = self.blocks(f_out)
+        f_out = self.conv_out(f_out)
+        up_flow0 = 2.0 * resize(flow0, scale_factor=2.0) + f_out[:, 0:2]
+        up_flow2 = 2.0 * resize(flow2, scale_factor=2.0) + f_out[:, 2:4]
+        up_mask0 = resize(mask0, scale_factor=2.0) + f_out[:, 4:5]
+        up_mask2 = resize(mask2, scale_factor=2.0) + f_out[:, 5:6]
+        return up_flow0, up_flow2, up_mask0, up_mask2
+
 class DecoderDCNLite(nn.Module):
     """Low-resolution specialized decoder for stage-2 refinement (L4/L3)."""
     def __init__(self, mid_channels=72):
         super().__init__()
         self.fgdcn = FlowGuidedDCN(48)
         self.conv1 = DeformConvRelu(150, mid_channels)
-        self.block = RepNeXtBlock(mid_channels, cond=False, expand_ratio=1.75)
+        self.block = RepNeXtBlockNoL(mid_channels, cond=False, expand_ratio=1.75)
         self.conv_out = deconv(mid_channels, 6)
 
     def forward(self, f0, f1, f2, flow0, flow2, mask0, mask2):
@@ -547,8 +630,8 @@ class ReliableMerge3Frame(nn.Module):
         in_channels = 9 + feat_channels * 3 + 2 + 2 + 3
         self.feat_net = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, 3, 1, 1, bias=True),
-            RepNeXtBlock(hidden_channels, expand_ratio=1.75),
-            RepNeXtBlock(hidden_channels, expand_ratio=1.75),
+            RepNeXtBlockNoL(hidden_channels, expand_ratio=1.75),
+            RepNeXtBlockNoL(hidden_channels, expand_ratio=1.75),
         )
         self.attn_head = nn.Conv2d(hidden_channels, 3, 1, 1, 0, bias=True)
         self.residual_head = nn.Conv2d(hidden_channels, 3, 3, 1, 1, bias=True)
@@ -577,9 +660,9 @@ class ReliableMerge3Frame(nn.Module):
 
 # ======================== StarRefineBlock ========================
 class StarRefineBlock(nn.Module):
-    def __init__(self, channels, dilation=1, expand_ratio=4.0, cond=True, num_experts=10):
+    def __init__(self, channels, dilation=1, expand_ratio=5.5, cond=True, num_experts=10):
         super().__init__()
-        # Ensure expand_ch is divisible by 8 so half_ch is divisible by 4 for ChunkConvV4
+        # Ensure expand_ch is divisible by 8 so half_ch is divisible by 4 for ChunkConvV3NoL
         expand_ch = int(np.ceil((channels * float(expand_ratio)) / 8.0) * 8)
         
         self.norm = nn.GroupNorm(1, channels)
@@ -592,8 +675,7 @@ class StarRefineBlock(nn.Module):
             
         half_ch = expand_ch // 2
         
-        # DW Conv using ChunkConvV4 on half the channels
-        self.dw = ChunkConvV4(half_ch, dilation=dilation)
+        self.dw = ChunkConvV3NoL(half_ch, dilation=dilation)
         
         self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
 
@@ -614,22 +696,23 @@ class StarRefineBlock(nn.Module):
 class RefineNet(nn.Module):
     def __init__(self, img_channels=4):
         super().__init__()
-        c0, c1, c2 = 22, 48, 22
+        c0, c1, c2 = 20, 44, 20
         total_c = c0 + c1 + c2
 
-        self.conv0 = nn.Sequential(convrelu(img_channels, c0), StarRefineBlock(c0, expand_ratio=3.55, cond=False))
+        self.conv0 = nn.Sequential(convrelu(img_channels, c0), StarRefineBlock(c0, expand_ratio=3.4, cond=False))
         self.conv1 = nn.Sequential(
             DeformConvRelu(img_channels + 2 + 2 + 1 + 1 + 3, c1),
-            StarRefineBlock(c1, expand_ratio=3.55, cond=False)
+            StarRefineBlock(c1, expand_ratio=3.4, cond=False)
         )
-        self.conv2 = nn.Sequential(convrelu(img_channels, c2), StarRefineBlock(c2, expand_ratio=3.55, cond=False))
+        self.conv2 = nn.Sequential(convrelu(img_channels, c2), StarRefineBlock(c2, expand_ratio=3.4, cond=False))
 
         self.blocks = nn.Sequential(
-            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=3.6),
+            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=3.45),
+            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.45),
+            StarRefineBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=4.0),
+            StarRefineBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=4.0),
+            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.45),
+            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=3.45),
         )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
@@ -695,13 +778,13 @@ class RefineNetPlus(RefineNet):
     def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
         return super().forward(img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m)
 
-# ======================== SAFNet_Claude_49 ========================
-class SAFNet_Claude_49(nn.Module):
+# ======================== SAFNet_Claude_51 ========================
+class SAFNet_Claude_51(nn.Module):
     def __init__(self):
         super().__init__()
         self.group_preparer = ExposureGroupPreparer()
         self.encoder = Encoder()
-        self.decoder_shared = DecoderDCN(
+        self.decoder_shared = DecoderDCNNoL(
             mid_channels=64, num_blocks=1, cond=True, num_experts=16, expand_ratio=1.75
         )
         self.decoder_refine_l4 = DecoderDCNLite(mid_channels=48)
@@ -834,7 +917,7 @@ def _print_profile(height=384, width=768, params_cap_m=5.0, flops_cap_g=100.0):
     device = torch.device("cpu")  # macOS compatibility (MPS deform op is often unsupported).
     dummy = torch.ones(1, 36, height, width, device=device)
 
-    model_before = SAFNet_Claude_49().to(device).eval()
+    model_before = SAFNet_Claude_51().to(device).eval()
     model_after = copy.deepcopy(model_before).to(device).eval()
     model_after.fuse_reparam()
 

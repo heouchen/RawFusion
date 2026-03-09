@@ -1,14 +1,10 @@
 """
-SAFNet_Claude_49 — Star-Operation (StarNet) Refinement
+SAFNet_Claude_52 — Iterative Two-Stage Star Refinement
 ======================================================
-Built on SAFNet_Claude_40. Fixes the "lack of high-dimensional non-linear interactions"
-bottleneck. Replaces RepNeXtBlock in RefineNet with StarRefineBlock. 
-StarRefineBlock expands channels massively, applies DW convolution on half of the 
-channels, and element-wise multiplies them for extreme implicit dimensionality and 
-non-linear expressivity at negligible computation.
-
-Target (fused): <= 5M params, <= 100G FLOPs for input (1, 36, 384, 768),
-which corresponds to full-size RGB output (1, 3, 768, 1536).
+Built on SAFNet_Claude_49. Keeps the proven alignment and merge path intact, then
+splits reconstruction into two explicit passes:
+1. Stage-A performs coarse residual recovery.
+2. Stage-B consumes Stage-A features and output to perform corrective refinement.
 """
 import numpy as np
 import math
@@ -611,35 +607,38 @@ class StarRefineBlock(nn.Module):
         return identity + y * self.scale
 
 # ======================== RefineNet ========================
-class RefineNet(nn.Module):
-    def __init__(self, img_channels=4):
+class IterativeRefineStage(nn.Module):
+    def __init__(self, img_channels=4, c0=18, c1=34, c2=18,
+                 conv_expand_ratio=2.4, block_expand_ratio=2.45,
+                 prev_feat_channels=None):
         super().__init__()
-        c0, c1, c2 = 22, 48, 22
+        if prev_feat_channels is None:
+            prev_feat_channels = c0 + c1 + c2
         total_c = c0 + c1 + c2
+        self.total_c = total_c
 
-        self.conv0 = nn.Sequential(convrelu(img_channels, c0), StarRefineBlock(c0, expand_ratio=3.55, cond=False))
+        self.conv0 = nn.Sequential(convrelu(img_channels, c0), StarRefineBlock(c0, expand_ratio=conv_expand_ratio, cond=False))
         self.conv1 = nn.Sequential(
-            DeformConvRelu(img_channels + 2 + 2 + 1 + 1 + 3, c1),
-            StarRefineBlock(c1, expand_ratio=3.55, cond=False)
+            DeformConvRelu(img_channels + 2 + 2 + 1 + 1 + 3 + prev_feat_channels + 3, c1),
+            StarRefineBlock(c1, expand_ratio=conv_expand_ratio, cond=False)
         )
-        self.conv2 = nn.Sequential(convrelu(img_channels, c2), StarRefineBlock(c2, expand_ratio=3.55, cond=False))
+        self.conv2 = nn.Sequential(convrelu(img_channels, c2), StarRefineBlock(c2, expand_ratio=conv_expand_ratio, cond=False))
 
         self.blocks = nn.Sequential(
-            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=3.6),
+            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=block_expand_ratio),
+            StarRefineBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=block_expand_ratio),
+            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=block_expand_ratio),
         )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
         self.pixel_shuffle = nn.PixelShuffle(2)
 
-    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
+    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m,
+                prev_feat, prev_rgb):
         feat0 = self.conv0(img0_c)
         feat1 = self.conv1(torch.cat([
             img4_c, flow0 / div_flow, flow8 / div_flow,
-            mask0, mask8, img_hdr_m], 1))
+            mask0, mask8, img_hdr_m, prev_feat, prev_rgb], 1))
         feat2 = self.conv2(img8_c)
 
         feat0_warp = warp(feat0, flow0)
@@ -648,9 +647,43 @@ class RefineNet(nn.Module):
 
         feat = self.blocks(feat)
         res = self.pixel_shuffle(self.conv3(feat))
+        return feat, res
+
+
+class RefineNet(nn.Module):
+    def __init__(self, img_channels=4):
+        super().__init__()
+        self.stage_a = IterativeRefineStage(
+            img_channels=img_channels, c0=18, c1=34, c2=18,
+            conv_expand_ratio=2.4, block_expand_ratio=2.45
+        )
+        self.stage_b = IterativeRefineStage(
+            img_channels=img_channels, c0=18, c1=58, c2=18,
+            conv_expand_ratio=2.4, block_expand_ratio=2.45,
+            prev_feat_channels=self.stage_a.total_c,
+        )
+        self.feat_bridge = nn.Sequential(
+            nn.Conv2d(self.stage_a.total_c, self.stage_a.total_c, 3, 1, 1, bias=True),
+            nn.PReLU(self.stage_a.total_c),
+        )
+
+    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
+        zeros_feat = img_hdr_m.new_zeros(
+            img_hdr_m.shape[0], self.stage_a.total_c, img_hdr_m.shape[2], img_hdr_m.shape[3]
+        )
+        zeros_rgb = img_hdr_m.new_zeros(img_hdr_m.shape[0], 3, img_hdr_m.shape[2], img_hdr_m.shape[3])
+        feat_a, res_a = self.stage_a(
+            img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m, zeros_feat, zeros_rgb
+        )
         img_hdr_m_up = F.interpolate(img_hdr_m, scale_factor=2,
                                      mode="bilinear", align_corners=False)
-        return torch.clamp(img_hdr_m_up + res, 0, 1)
+        out_a = torch.clamp(img_hdr_m_up + res_a, 0, 1)
+        feat_b, res_b = self.stage_b(
+            img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m,
+            self.feat_bridge(feat_a),
+            F.interpolate(out_a, scale_factor=0.5, mode="bilinear", align_corners=False),
+        )
+        return torch.clamp(out_a + res_b, 0, 1)
 
 
 class HighResTailBlock(nn.Module):
@@ -695,8 +728,8 @@ class RefineNetPlus(RefineNet):
     def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
         return super().forward(img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m)
 
-# ======================== SAFNet_Claude_49 ========================
-class SAFNet_Claude_49(nn.Module):
+# ======================== SAFNet_Claude_52 ========================
+class SAFNet_Claude_52(nn.Module):
     def __init__(self):
         super().__init__()
         self.group_preparer = ExposureGroupPreparer()
@@ -834,7 +867,7 @@ def _print_profile(height=384, width=768, params_cap_m=5.0, flops_cap_g=100.0):
     device = torch.device("cpu")  # macOS compatibility (MPS deform op is often unsupported).
     dummy = torch.ones(1, 36, height, width, device=device)
 
-    model_before = SAFNet_Claude_49().to(device).eval()
+    model_before = SAFNet_Claude_52().to(device).eval()
     model_after = copy.deepcopy(model_before).to(device).eval()
     model_after.fuse_reparam()
 
