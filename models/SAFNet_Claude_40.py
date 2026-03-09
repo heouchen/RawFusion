@@ -590,11 +590,11 @@ class RefineNet(nn.Module):
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), RepNeXtBlock(c2))
 
         self.blocks = nn.Sequential(
-            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2.0),
-            RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.0),
-            RepNeXtBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=2.0),
-            RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.0),
-            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2.0),
+            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2.5),
+            RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.5),
+            RepNeXtBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=2.5),
+            RepNeXtBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=2.5),
+            RepNeXtBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=2),
         )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
@@ -618,50 +618,6 @@ class RefineNet(nn.Module):
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
 
-class HighResTailBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.norm = nn.GroupNorm(1, channels)
-        self.dw = nn.Conv2d(channels, channels, 5, 1, 2, groups=channels, bias=True)
-        self.pw1 = nn.Conv2d(channels, channels * 2, 1, 1, 0, bias=True)
-        self.act = nn.GELU()
-        self.pw2 = nn.Conv2d(channels * 2, channels, 1, 1, 0, bias=True)
-        self.scale = nn.Parameter(torch.ones(1, channels, 1, 1) * 0.1)
-
-    def forward(self, x):
-        y = self.norm(x)
-        y = self.dw(y)
-        y = self.pw1(y)
-        y = self.act(y)
-        y = self.pw2(y)
-        return x + y * self.scale
-
-
-class HighResRefineTail(nn.Module):
-    def __init__(self, hidden_channels=12):
-        super().__init__()
-        self.in_proj = nn.Sequential(
-            nn.Conv2d(3, hidden_channels, 3, 1, 1, bias=True),
-            nn.PReLU(hidden_channels),
-        )
-        self.block = HighResTailBlock(hidden_channels)
-        self.out_proj = nn.Conv2d(hidden_channels, 3, 3, 1, 1, bias=True)
-
-    def forward(self, x):
-        feat = self.in_proj(x)
-        feat = self.block(feat)
-        return self.out_proj(feat)
-
-
-class RefineNetPlus(RefineNet):
-    def __init__(self, img_channels=4):
-        super().__init__(img_channels=img_channels)
-        self.tail = HighResRefineTail(hidden_channels=12)
-
-    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
-        out = super().forward(img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m)
-        out = out + 0.10 * self.tail(out)
-        return torch.clamp(out, 0, 1)
 
 # ======================== SAFNet_Claude_40 ========================
 class SAFNet_Claude_40(nn.Module):
@@ -670,17 +626,13 @@ class SAFNet_Claude_40(nn.Module):
         self.group_preparer = ExposureGroupPreparer()
         self.encoder = Encoder()
         self.decoder_shared = DecoderDCN(
-            mid_channels=96, num_blocks=2, cond=True, num_experts=16, expand_ratio=2.0
+            mid_channels=32, num_blocks=1, cond=True, num_experts=4, expand_ratio=2.0
         )
-        self.decoder_refine_l4 = DecoderDCNLite(mid_channels=72)
-        self.decoder_refine_l3 = DecoderDCNLite(mid_channels=72)
-        self.adapter_l1 = FlowFeatureAdapter(48)
-        self.adapter_l2 = FlowFeatureAdapter(48)
-        self.adapter_l3 = FlowFeatureAdapter(48)
+        self.decoder_refine_l4 = DecoderDCNLite(mid_channels=32)
         self.adapter_l4 = FlowFeatureAdapter(48)
         self.merge_stem = MergeFeatureStem(4, 6)
         self.learned_merge = ReliableMerge3Frame(feat_channels=6, hidden_channels=36)
-        self.refinenet = RefineNetPlus()
+        self.refinenet = RefineNet()
 
     def fuse_reparam(self):
         for m in self.modules():
@@ -712,29 +664,17 @@ class SAFNet_Claude_40(nn.Module):
             f0_4, f4_4, f8_4, up_flow0_5, up_flow8_5, up_mask0_5, up_mask8_5)
         up_flow0_3, up_flow8_3, up_mask0_3, up_mask8_3 = self.decoder_shared(
             f0_3, f4_3, f8_3, up_flow0_4, up_flow8_4, up_mask0_4, up_mask8_4)
-        up_flow0_2, up_flow8_2, up_mask0_2, up_mask8_2 = self.decoder_shared(
-            f0_2, f4_2, f8_2, up_flow0_3, up_flow8_3, up_mask0_3, up_mask8_3)
-        up_flow0_1, up_flow8_1, up_mask0_1, up_mask8_1 = self.decoder_shared(
-            f0_1, f4_1, f8_1, up_flow0_2, up_flow8_2, up_mask0_2, up_mask8_2)
+        
+        # Stage-1: Stop at L3 (1/8 Scale). Interpolate L2 and L1.
+        up_flow0_1 = 4.0 * resize(up_flow0_3, scale_factor=4.0)
+        up_flow8_1 = 4.0 * resize(up_flow8_3, scale_factor=4.0)
+        up_mask0_1 = resize(up_mask0_3, scale_factor=4.0)
+        up_mask8_1 = resize(up_mask8_3, scale_factor=4.0)
 
-        # Stage-2: reuse stage-1 encoder features, warp by coarse full-res flow,
-        # then adapt with lightweight per-level feature adapters.
-        flow0_l1 = resize_flow(up_flow0_1, f0_1.shape[-2:])
-        flow0_l2 = resize_flow(up_flow0_1, f0_2.shape[-2:])
-        flow0_l3 = resize_flow(up_flow0_1, f0_3.shape[-2:])
-        flow0_l4 = resize_flow(up_flow0_1, f0_4.shape[-2:])
-        flow8_l1 = resize_flow(up_flow8_1, f8_1.shape[-2:])
-        flow8_l2 = resize_flow(up_flow8_1, f8_2.shape[-2:])
-        flow8_l3 = resize_flow(up_flow8_1, f8_3.shape[-2:])
-        flow8_l4 = resize_flow(up_flow8_1, f8_4.shape[-2:])
-
-        f0w_1 = self.adapter_l1(f0_1, warp(f0_1, flow0_l1))
-        f0w_2 = self.adapter_l2(f0_2, warp(f0_2, flow0_l2))
-        f0w_3 = self.adapter_l3(f0_3, warp(f0_3, flow0_l3))
+        # Stage-2: selective adaptation (Only L4 needed for Extreme Pruning)
+        flow0_l4 = resize_flow(up_flow0_4, f0_4.shape[-2:])
+        flow8_l4 = resize_flow(up_flow8_4, f8_4.shape[-2:])
         f0w_4 = self.adapter_l4(f0_4, warp(f0_4, flow0_l4))
-        f8w_1 = self.adapter_l1(f8_1, warp(f8_1, flow8_l1))
-        f8w_2 = self.adapter_l2(f8_2, warp(f8_2, flow8_l2))
-        f8w_3 = self.adapter_l3(f8_3, warp(f8_3, flow8_l3))
         f8w_4 = self.adapter_l4(f8_4, warp(f8_4, flow8_l4))
 
         up_rflow0_5 = torch.zeros_like(f4_4[:, 0:2])
@@ -742,14 +682,15 @@ class SAFNet_Claude_40(nn.Module):
         up_rmask0_5 = torch.zeros_like(f4_4[:, 0:1])
         up_rmask8_5 = torch.zeros_like(f4_4[:, 0:1])
 
+        # Stage-2: Extreme Pruning - Only Refine L4 (1/16 Scale)
         up_rflow0_4, up_rflow8_4, up_rmask0_4, up_rmask8_4 = self.decoder_refine_l4(
             f0w_4, f4_4, f8w_4, up_rflow0_5, up_rflow8_5, up_rmask0_5, up_rmask8_5)
-        up_rflow0_3, up_rflow8_3, up_rmask0_3, up_rmask8_3 = self.decoder_refine_l3(
-            f0w_3, f4_3, f8w_3, up_rflow0_4, up_rflow8_4, up_rmask0_4, up_rmask8_4)
-        up_rflow0_2, up_rflow8_2, up_rmask0_2, up_rmask8_2 = self.decoder_shared(
-            f0w_2, f4_2, f8w_2, up_rflow0_3, up_rflow8_3, up_rmask0_3, up_rmask8_3)
-        up_rflow0_1, up_rflow8_1, up_rmask0_1, up_rmask8_1 = self.decoder_shared(
-            f0w_1, f4_1, f8w_1, up_rflow0_2, up_rflow8_2, up_rmask0_2, up_rmask8_2)
+        
+        # Bypass Refinement for L3, L2, L1
+        up_rflow0_1 = 8.0 * resize(up_rflow0_4, scale_factor=8.0)
+        up_rflow8_1 = 8.0 * resize(up_rflow8_4, scale_factor=8.0)
+        up_rmask0_1 = resize(up_rmask0_4, scale_factor=8.0)
+        up_rmask8_1 = resize(up_rmask8_4, scale_factor=8.0)
 
         final_flow0 = up_flow0_1 + up_rflow0_1
         final_flow8 = up_flow8_1 + up_rflow8_1

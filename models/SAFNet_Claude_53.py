@@ -663,11 +663,11 @@ class RefineNet(nn.Module):
         self.conv2 = nn.Sequential(convrelu(img_channels, c2), StarRefineBlock(c2, expand_ratio=3.55, cond=False))
 
         self.blocks = nn.Sequential(
-            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.6),
-            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=3.6),
+            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=3.8),
+            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.8),
+            StarRefineBlock(total_c, dilation=4, cond=True, num_experts=10, expand_ratio=3.8),
+            StarRefineBlock(total_c, dilation=2, cond=True, num_experts=10, expand_ratio=3.8),
+            StarRefineBlock(total_c, dilation=1, cond=True, num_experts=10, expand_ratio=3.8),
         )
 
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
@@ -741,11 +741,10 @@ class SAFNet_Claude_53(nn.Module):
         self.group_preparer = ExposureGroupPreparer()
         self.encoder = Encoder()
         self.decoder_shared = DecoderDCN(
-            mid_channels=64, num_blocks=1, cond=True, num_experts=16, expand_ratio=1.75
+            mid_channels=32, num_blocks=1, cond=True, num_experts=4, expand_ratio=2.0
         )
-        self.decoder_refine_l4 = DecoderDCNLite(mid_channels=48)
-        self.decoder_refine_l3 = DecoderDCNLite(mid_channels=48)
-        self.adapter_l3 = FlowFeatureAdapter(48)
+        self.decoder_refine_l4 = DecoderDCNLite(mid_channels=32)
+        # decoder_refine_l3 removed: Extreme Pruning stops refinement at L4
         self.adapter_l4 = FlowFeatureAdapter(48)
         self.merge_stem = MergeFeatureStem(4, 6)
         self.learned_merge = ReliableMerge3Frame(feat_channels=6, hidden_channels=36)
@@ -781,21 +780,15 @@ class SAFNet_Claude_53(nn.Module):
             f0_4, f4_4, f8_4, up_flow0_5, up_flow8_5, up_mask0_5, up_mask8_5)
         up_flow0_3, up_flow8_3, up_mask0_3, up_mask8_3 = self.decoder_shared(
             f0_3, f4_3, f8_3, up_flow0_4, up_flow8_4, up_mask0_4, up_mask8_4)
-        up_flow0_2, up_flow8_2, up_mask0_2, up_mask8_2 = self.decoder_shared(
-            f0_2, f4_2, f8_2, up_flow0_3, up_flow8_3, up_mask0_3, up_mask8_3)
-        up_flow0_1, up_flow8_1, up_mask0_1, up_mask8_1 = self.decoder_shared(
-            f0_1, f4_1, f8_1, up_flow0_2, up_flow8_2, up_mask0_2, up_mask8_2)
+        
+        # Stage-1: Stop at L3 (1/8 Scale). Interpolate L2 and L1.
+        up_flow0_1 = 4.0 * resize(up_flow0_3, scale_factor=4.0)
+        up_flow8_1 = 4.0 * resize(up_flow8_3, scale_factor=4.0)
 
-        # Stage-2: reuse stage-1 encoder features, warp by coarse full-res flow,
-        # then adapt with lightweight per-level feature adapters.
-        flow0_l3 = resize_flow(up_flow0_1, f0_3.shape[-2:])
-        flow0_l4 = resize_flow(up_flow0_1, f0_4.shape[-2:])
-        flow8_l3 = resize_flow(up_flow8_1, f8_3.shape[-2:])
-        flow8_l4 = resize_flow(up_flow8_1, f8_4.shape[-2:])
-
-        f0w_3 = self.adapter_l3(f0_3, warp(f0_3, flow0_l3))
+        # Stage-2: selective adaptation (Only L4 needed for Extreme Pruning)
+        flow0_l4 = resize_flow(up_flow0_4, f0_4.shape[-2:])
+        flow8_l4 = resize_flow(up_flow8_4, f8_4.shape[-2:])
         f0w_4 = self.adapter_l4(f0_4, warp(f0_4, flow0_l4))
-        f8w_3 = self.adapter_l3(f8_3, warp(f8_3, flow8_l3))
         f8w_4 = self.adapter_l4(f8_4, warp(f8_4, flow8_l4))
 
         up_rflow0_5 = torch.zeros_like(f4_4[:, 0:2])
@@ -803,18 +796,15 @@ class SAFNet_Claude_53(nn.Module):
         up_rmask0_5 = torch.zeros_like(f4_4[:, 0:1])
         up_rmask8_5 = torch.zeros_like(f4_4[:, 0:1])
 
+        # Stage-2: Extreme Pruning - Only Refine L4 (1/16 Scale)
         up_rflow0_4, up_rflow8_4, up_rmask0_4, up_rmask8_4 = self.decoder_refine_l4(
             f0w_4, f4_4, f8w_4, up_rflow0_5, up_rflow8_5, up_rmask0_5, up_rmask8_5)
-        up_rflow0_3, up_rflow8_3, up_rmask0_3, up_rmask8_3 = self.decoder_refine_l3(
-            f0w_3, f4_3, f8w_3, up_rflow0_4, up_rflow8_4, up_rmask0_4, up_rmask8_4)
-        up_rflow0_2 = resize_flow(up_rflow0_3, f4_1.shape[-2:])
-        up_rflow8_2 = resize_flow(up_rflow8_3, f4_1.shape[-2:])
-        up_rmask0_2 = F.interpolate(up_rmask0_3, size=f4_1.shape[-2:], mode='bilinear', align_corners=False)
-        up_rmask8_2 = F.interpolate(up_rmask8_3, size=f4_1.shape[-2:], mode='bilinear', align_corners=False)
-        up_rflow0_1 = resize_flow(up_rflow0_2, img4_c.shape[-2:])
-        up_rflow8_1 = resize_flow(up_rflow8_2, img4_c.shape[-2:])
-        up_rmask0_1 = F.interpolate(up_rmask0_2, size=img4_c.shape[-2:], mode='bilinear', align_corners=False)
-        up_rmask8_1 = F.interpolate(up_rmask8_2, size=img4_c.shape[-2:], mode='bilinear', align_corners=False)
+        
+        # Bypass Refinement for L3, L2, L1
+        up_rflow0_1 = 8.0 * resize(up_rflow0_4, scale_factor=8.0)
+        up_rflow8_1 = 8.0 * resize(up_rflow8_4, scale_factor=8.0)
+        up_rmask0_1 = resize(up_rmask0_4, scale_factor=8.0)
+        up_rmask8_1 = resize(up_rmask8_4, scale_factor=8.0)
 
         final_flow0 = up_flow0_1 + up_rflow0_1
         final_flow8 = up_flow8_1 + up_rflow8_1
@@ -832,6 +822,7 @@ class SAFNet_Claude_53(nn.Module):
             up_rmask8_1 = F.interpolate(up_rmask8_1, size=org_size, mode='bilinear', align_corners=False)
 
         return torch.sigmoid(up_rmask0_1), torch.sigmoid(up_rmask8_1), final_flow0, final_flow8
+
 
     def forward(self, x, scale_factor=0.5, refine=True):
         img0_c, img4_c, img8_c = self.group_preparer(x)

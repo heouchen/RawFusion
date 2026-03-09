@@ -73,9 +73,6 @@ mkdir -p output_log
 EMA_ENABLE="0"
 pretrained=""
 
-# echo "开始执行..."
-# sleep 3h
-# echo "3小时后继续执行..."
 
 run_one () {
 
@@ -146,9 +143,14 @@ run_one () {
 # run_one "safnet_claude_44" "model_submit_claude44"
 # run_one "safnet_claude_45" "model_submit_claude45"
 # run_one "safnet_claude_46" "model_submit_claude46"
-run_one "safnet_claude_47" "model_submit_claude47"
-run_one "safnet_claude_48" "model_submit_claude48"
-run_one "safnet_claude_49" "model_submit_claude49"
+# run_one "safnet_claude_47" "model_submit_claude47"
+# run_one "safnet_claude_48" "model_submit_claude48"
+
+run_one "safnet_claude_50" "model_submit_claude50"
+run_one "safnet_claude_51" "model_submit_claude51"
+run_one "safnet_claude_52" "model_submit_claude52"
+run_one "safnet_claude_53" "model_submit_claude53"
+run_one "safnet_claude_54" "model_submit_claude54"
 
 # CONSIST_ENABLE="${CONSIST_ENABLE:-1}" \
 # CROP_SIZES="192x384,384x768" \
