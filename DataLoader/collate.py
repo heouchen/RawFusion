@@ -1,5 +1,5 @@
 import torch
-from DataLoader.custom_data_class import HDRBurstAugment
+from DataLoader.custom_data_class import HDRBurstAugment, finalize_input_tensor
 
 
 def parse_crop_sizes(s: str):
@@ -140,6 +140,7 @@ def make_train_collate(augment: HDRBurstAugment, crop_sizes, batch_geom=False, c
         if (augment is None) or (not augment.enable):
             inputs = torch.stack([b[0] for b in batch], dim=0)
             targets = torch.stack([b[1] for b in batch], dim=0)
+            inputs = finalize_input_tensor(inputs)
             return inputs, targets
 
         geom = None
@@ -172,6 +173,9 @@ def make_train_collate(augment: HDRBurstAugment, crop_sizes, batch_geom=False, c
 
         inputs = torch.stack([a[0] for a in augmented], dim=0)
         targets = torch.stack([a[1] for a in augmented], dim=0)
+        inputs = finalize_input_tensor(inputs)
+        if augment.clamp:
+            targets = targets.clamp(0.0, 1.0)
 
         # Generate consistency crops if enabled
         if consist_enable and consist_sizes:
@@ -208,4 +212,3 @@ def make_train_collate(augment: HDRBurstAugment, crop_sizes, batch_geom=False, c
         return inputs, targets
 
     return _collate
-

@@ -3,7 +3,6 @@ import torchvision.transforms as transforms
 import os
 import cv2
 import numpy as np
-from tqdm import tqdm
 from typing import Optional, List, Tuple
 
 
@@ -101,7 +100,8 @@ class HDRBurstAugment:
             inputs, target = self._apply_geom(inputs, target, geom)
 
         if self.clamp:
-            inputs = inputs.clamp(0.0, 1.0)
+            if torch.is_floating_point(inputs):
+                inputs = inputs.clamp(0.0, 1.0)
             target = target.clamp(0.0, 1.0)
         return inputs.contiguous(), target.contiguous()
 
@@ -125,9 +125,43 @@ class HDRBurstAugment:
             inputs, target = self._apply_geom(inputs, target, geom)
 
         if self.clamp:
-            inputs = inputs.clamp(0.0, 1.0)
+            if torch.is_floating_point(inputs):
+                inputs = inputs.clamp(0.0, 1.0)
             target = target.clamp(0.0, 1.0)
         return inputs.contiguous(), target.contiguous()
+
+
+def pack_raw_bayer(arr: np.ndarray) -> torch.Tensor:
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+
+    g1 = arr[0::2, 0::2]
+    r = arr[0::2, 1::2]
+    b = arr[1::2, 0::2]
+    g2 = arr[1::2, 1::2]
+    packed = np.stack([r, g1, g2, b], axis=0)
+    return torch.from_numpy(np.ascontiguousarray(packed))
+
+
+def to_float_tensor(arr: np.ndarray) -> torch.Tensor:
+    tensor = torch.from_numpy(np.ascontiguousarray(arr))
+    if tensor.ndim == 3:
+        tensor = tensor.permute(2, 0, 1)
+    tensor = tensor.float()
+    if arr.dtype == np.uint16:
+        tensor.div_(65535.0)
+    elif arr.dtype == np.uint8:
+        tensor.div_(255.0)
+    return tensor
+
+
+def finalize_input_tensor(inputs: torch.Tensor) -> torch.Tensor:
+    if inputs.dtype == torch.uint16:
+        inputs = inputs.float().div_(65535.0)
+    else:
+        inputs = inputs.float()
+    inputs.clamp_(min=0.0)
+    return inputs.pow_(1 / 2.2)
 
 
 class CustomDataset(torch.utils.data.Dataset):
@@ -137,12 +171,14 @@ class CustomDataset(torch.utils.data.Dataset):
         transform=transforms.ToTensor(),
         train=True,
         augment: Optional[HDRBurstAugment] = None,
+        finalize_inputs: bool = True,
     ):
         super(CustomDataset, self).__init__()
         self.root_dir = root_dir.rstrip("/") + "/"
         self.transform = transform
         self.train = train
         self.augment = augment
+        self.finalize_inputs = bool(finalize_inputs)
 
         all_files = os.listdir(self.root_dir)
         self.scene_ids = sorted(
@@ -150,50 +186,37 @@ class CustomDataset(torch.utils.data.Dataset):
         )
         n_scenes = len(self.scene_ids)
         print(f"Found {n_scenes} scenes in {self.root_dir}")
-
-        self.cache = []
-        for idx in tqdm(range(n_scenes), desc="Loading dataset and packing Bayer", ncols=80):
-            scene_id = self.scene_ids[idx]
-            input_tensors = []
-            for i in range(9):
-                img_path = f"{self.root_dir}Scene-{scene_id:03d}-in-{i}.tif"
-                arr = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-                if arr is None:
-                    raise FileNotFoundError(f"Cannot read: {img_path}")
-                
-                # 处理伪三通道
-                if len(arr.shape) == 3:
-                    arr = arr[:, :, 0]
-                
-                # Bayer Packing (GRBG pattern)
-                # G1 R
-                # B G2
-                g1 = arr[0::2, 0::2]
-                r  = arr[0::2, 1::2]
-                b  = arr[1::2, 0::2]
-                g2 = arr[1::2, 1::2]
-                
-                packed = np.stack([r, g1, g2, b], axis=0) # (4, 384, 768)
-                input_tensors.append((torch.from_numpy(packed).float() / 65535.0)**(1/2.2) if arr.dtype == np.uint16 else (torch.from_numpy(packed).float())**(1/2.2))
-
+        self.samples = []
+        for scene_id in self.scene_ids:
+            input_paths = [
+                f"{self.root_dir}Scene-{scene_id:03d}-in-{i}.tif"
+                for i in range(9)
+            ]
             gt_path = f"{self.root_dir}Scene-{scene_id:03d}-gt.tif"
-            gt_arr = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED)
-            if gt_arr is None:
-                raise FileNotFoundError(f"Cannot read: {gt_path}")
-            
-            # GT (768, 1536, 3) -> (3, 768, 1536)
-            gt_tensor = self.transform(gt_arr) if self.transform else torch.from_numpy(gt_arr).permute(2,0,1).float()
-
-            inputs = torch.stack(input_tensors)  # (9, 4, 384, 768)
-            self.cache.append((inputs, gt_tensor))
-
-        print(f"Cached {len(self.cache)} scenes in memory.")
+            self.samples.append((input_paths, gt_path))
 
     def __len__(self):
-        return len(self.cache)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        inputs, target = self.cache[idx]
+        input_paths, gt_path = self.samples[idx]
+        input_tensors = []
+        for img_path in input_paths:
+            arr = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+            if arr is None:
+                raise FileNotFoundError(f"Cannot read: {img_path}")
+            input_tensors.append(pack_raw_bayer(arr))
+
+        gt_arr = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED)
+        if gt_arr is None:
+            raise FileNotFoundError(f"Cannot read: {gt_path}")
+
+        inputs = torch.stack(input_tensors, dim=0)
+        target = to_float_tensor(gt_arr)
         if self.train and (self.augment is not None):
             inputs, target = self.augment(inputs, target)
+            if self.augment.clamp:
+                target = target.clamp(0.0, 1.0)
+        if self.finalize_inputs:
+            inputs = finalize_input_tensor(inputs)
         return inputs, target

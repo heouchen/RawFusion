@@ -122,17 +122,18 @@ def train(
         transform=transforms.ToTensor(),
         train=True,
         augment=None if use_batch_collate else train_aug,
+        finalize_inputs=not (use_batch_collate or consist_enable),
     )
-    num_workers = num_threads
+    #num_workers = num_threads
 
     def build_train_loader(curr_batch_size):
         return torch.utils.data.DataLoader(
             train_set,
             batch_size=curr_batch_size,
             shuffle=True,
-            num_workers=num_workers,
+            num_workers=4,
             pin_memory=cuda,
-            persistent_workers=(num_workers > 0),
+            persistent_workers=(4 > 0),
             collate_fn=make_train_collate(
                 train_aug,
                 aug_crop_sizes,
@@ -150,6 +151,7 @@ def train(
         transform=transforms.ToTensor(),
         train=False,
         augment=None,
+        finalize_inputs=True,
     )
     val_loader = torch.utils.data.DataLoader(
         val_set,
@@ -307,7 +309,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--lr_decay', type=float, default=0.95)
-    parser.add_argument('--num_threads', type=int, default=1)
+    parser.add_argument('--num_threads', type=int, default=2)
     parser.add_argument('--cuda', type=int, default=1)
     parser.add_argument('--mgpu', type=int, default=1)
     parser.add_argument('--restart_train', type=int, default=1)
