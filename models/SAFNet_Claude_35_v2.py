@@ -497,12 +497,12 @@ class LearnedMerge3Frame(nn.Module):
         )
         self.attn_head = nn.Conv2d(48, 3, 1, 1, 0)
 
-    def forward(self, img0_w, img4, img8_w, mask0, mask8):
-        x = torch.cat([img0_w, img4, img8_w, mask0, mask8], dim=1)
+    def forward(self, img4_w, img0, img8_w, mask4, mask8):
+        x = torch.cat([img4_w, img0, img8_w, mask4, mask8], dim=1)
         feat = self.feat_net(x)
         weights = torch.softmax(self.attn_head(feat), dim=1)
-        return (weights[:, 0:1] * img0_w +
-                weights[:, 1:2] * img4 +
+        return (weights[:, 0:1] * img4_w +
+                weights[:, 1:2] * img0 +
                 weights[:, 2:3] * img8_w)
 
 # ======================== RefineNet ========================
@@ -530,16 +530,16 @@ class RefineNet(nn.Module):
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
         self.pixel_shuffle = nn.PixelShuffle(2)
 
-    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
-        feat0 = self.conv0(img0_c)
+    def forward(self, img0_c, img4_c, img8_c, flow4, flow8, mask4, mask8, img_hdr_m):
+        feat4 = self.conv0(img4_c)
         feat1 = self.conv1(torch.cat([
-            img4_c, flow0 / div_flow, flow8 / div_flow,
-            mask0, mask8, img_hdr_m], 1))
+            img0_c, flow4 / div_flow, flow8 / div_flow,
+            mask4, mask8, img_hdr_m], 1))
         feat2 = self.conv2(img8_c)
 
-        feat0_warp = warp(feat0, flow0)
+        feat4_warp = warp(feat4, flow4)
         feat2_warp = warp(feat2, flow8)
-        feat = torch.cat([feat0_warp, feat1, feat2_warp], 1)
+        feat = torch.cat([feat4_warp, feat1, feat2_warp], 1)
 
         feat = self.blocks(feat)
         res = self.pixel_shuffle(self.conv3(feat))
@@ -572,7 +572,7 @@ class SAFNet_Claude_35_v2(nn.Module):
                 m.fuse()
 
     def forward_flow_mask(self, img0_c, img4_c, img8_c, scale_factor=0.5):
-        h, w = img4_c.shape[-2:]
+        h, w = img0_c.shape[-2:]
         org_size = (int(h), int(w))
         input_size = (
             int(div_size * math.ceil(float(h) * scale_factor / div_size)),
@@ -587,88 +587,88 @@ class SAFNet_Claude_35_v2(nn.Module):
         f4_1, f4_2, f4_3, f4_4 = self.encoder(img4_c)
         f8_1, f8_2, f8_3, f8_4 = self.encoder(img8_c)
 
-        up_flow0_5 = torch.zeros_like(f4_4[:, 0:2])
-        up_flow8_5 = torch.zeros_like(f4_4[:, 0:2])
-        up_mask0_5 = torch.zeros_like(f4_4[:, 0:1])
-        up_mask8_5 = torch.zeros_like(f4_4[:, 0:1])
+        up_flow4_5 = torch.zeros_like(f0_4[:, 0:2])
+        up_flow8_5 = torch.zeros_like(f0_4[:, 0:2])
+        up_mask4_5 = torch.zeros_like(f0_4[:, 0:1])
+        up_mask8_5 = torch.zeros_like(f0_4[:, 0:1])
 
-        up_flow0_4, up_flow8_4, up_mask0_4, up_mask8_4 = self.decoder_shared(
-            f0_4, f4_4, f8_4, up_flow0_5, up_flow8_5, up_mask0_5, up_mask8_5)
-        up_flow0_3, up_flow8_3, up_mask0_3, up_mask8_3 = self.decoder_shared(
-            f0_3, f4_3, f8_3, up_flow0_4, up_flow8_4, up_mask0_4, up_mask8_4)
-        up_flow0_2, up_flow8_2, up_mask0_2, up_mask8_2 = self.decoder_shared(
-            f0_2, f4_2, f8_2, up_flow0_3, up_flow8_3, up_mask0_3, up_mask8_3)
-        up_flow0_1, up_flow8_1, up_mask0_1, up_mask8_1 = self.decoder_shared(
-            f0_1, f4_1, f8_1, up_flow0_2, up_flow8_2, up_mask0_2, up_mask8_2)
+        up_flow4_4, up_flow8_4, up_mask4_4, up_mask8_4 = self.decoder_shared(
+            f4_4, f0_4, f8_4, up_flow4_5, up_flow8_5, up_mask4_5, up_mask8_5)
+        up_flow4_3, up_flow8_3, up_mask4_3, up_mask8_3 = self.decoder_shared(
+            f4_3, f0_3, f8_3, up_flow4_4, up_flow8_4, up_mask4_4, up_mask8_4)
+        up_flow4_2, up_flow8_2, up_mask4_2, up_mask8_2 = self.decoder_shared(
+            f4_2, f0_2, f8_2, up_flow4_3, up_flow8_3, up_mask4_3, up_mask8_3)
+        up_flow4_1, up_flow8_1, up_mask4_1, up_mask8_1 = self.decoder_shared(
+            f4_1, f0_1, f8_1, up_flow4_2, up_flow8_2, up_mask4_2, up_mask8_2)
 
-        # Stage-2: reuse stage-1 encoder features, warp by coarse full-res flow,
-        # then adapt with lightweight per-level feature adapters.
-        flow0_l1 = resize_flow(up_flow0_1, f0_1.shape[-2:])
-        flow0_l2 = resize_flow(up_flow0_1, f0_2.shape[-2:])
-        flow0_l3 = resize_flow(up_flow0_1, f0_3.shape[-2:])
-        flow0_l4 = resize_flow(up_flow0_1, f0_4.shape[-2:])
+        # Stage-2: reuse stage-1 encoder features, warp non-reference branches
+        # toward the GT-aligned img0 reference.
+        flow4_l1 = resize_flow(up_flow4_1, f4_1.shape[-2:])
+        flow4_l2 = resize_flow(up_flow4_1, f4_2.shape[-2:])
+        flow4_l3 = resize_flow(up_flow4_1, f4_3.shape[-2:])
+        flow4_l4 = resize_flow(up_flow4_1, f4_4.shape[-2:])
         flow8_l1 = resize_flow(up_flow8_1, f8_1.shape[-2:])
         flow8_l2 = resize_flow(up_flow8_1, f8_2.shape[-2:])
         flow8_l3 = resize_flow(up_flow8_1, f8_3.shape[-2:])
         flow8_l4 = resize_flow(up_flow8_1, f8_4.shape[-2:])
 
-        f0w_1 = self.adapter_l1(f0_1, warp(f0_1, flow0_l1))
-        f0w_2 = self.adapter_l2(f0_2, warp(f0_2, flow0_l2))
-        f0w_3 = self.adapter_l3(f0_3, warp(f0_3, flow0_l3))
-        f0w_4 = self.adapter_l4(f0_4, warp(f0_4, flow0_l4))
+        f4w_1 = self.adapter_l1(f4_1, warp(f4_1, flow4_l1))
+        f4w_2 = self.adapter_l2(f4_2, warp(f4_2, flow4_l2))
+        f4w_3 = self.adapter_l3(f4_3, warp(f4_3, flow4_l3))
+        f4w_4 = self.adapter_l4(f4_4, warp(f4_4, flow4_l4))
         f8w_1 = self.adapter_l1(f8_1, warp(f8_1, flow8_l1))
         f8w_2 = self.adapter_l2(f8_2, warp(f8_2, flow8_l2))
         f8w_3 = self.adapter_l3(f8_3, warp(f8_3, flow8_l3))
         f8w_4 = self.adapter_l4(f8_4, warp(f8_4, flow8_l4))
 
-        up_rflow0_5 = torch.zeros_like(f4_4[:, 0:2])
-        up_rflow8_5 = torch.zeros_like(f4_4[:, 0:2])
-        up_rmask0_5 = torch.zeros_like(f4_4[:, 0:1])
-        up_rmask8_5 = torch.zeros_like(f4_4[:, 0:1])
+        up_rflow4_5 = torch.zeros_like(f0_4[:, 0:2])
+        up_rflow8_5 = torch.zeros_like(f0_4[:, 0:2])
+        up_rmask4_5 = torch.zeros_like(f0_4[:, 0:1])
+        up_rmask8_5 = torch.zeros_like(f0_4[:, 0:1])
 
-        up_rflow0_4, up_rflow8_4, up_rmask0_4, up_rmask8_4 = self.decoder_refine_l4(
-            f0w_4, f4_4, f8w_4, up_rflow0_5, up_rflow8_5, up_rmask0_5, up_rmask8_5)
-        up_rflow0_3, up_rflow8_3, up_rmask0_3, up_rmask8_3 = self.decoder_refine_l3(
-            f0w_3, f4_3, f8w_3, up_rflow0_4, up_rflow8_4, up_rmask0_4, up_rmask8_4)
-        up_rflow0_2, up_rflow8_2, up_rmask0_2, up_rmask8_2 = self.decoder_shared(
-            f0w_2, f4_2, f8w_2, up_rflow0_3, up_rflow8_3, up_rmask0_3, up_rmask8_3)
-        up_rflow0_1, up_rflow8_1, up_rmask0_1, up_rmask8_1 = self.decoder_shared(
-            f0w_1, f4_1, f8w_1, up_rflow0_2, up_rflow8_2, up_rmask0_2, up_rmask8_2)
+        up_rflow4_4, up_rflow8_4, up_rmask4_4, up_rmask8_4 = self.decoder_refine_l4(
+            f4w_4, f0_4, f8w_4, up_rflow4_5, up_rflow8_5, up_rmask4_5, up_rmask8_5)
+        up_rflow4_3, up_rflow8_3, up_rmask4_3, up_rmask8_3 = self.decoder_refine_l3(
+            f4w_3, f0_3, f8w_3, up_rflow4_4, up_rflow8_4, up_rmask4_4, up_rmask8_4)
+        up_rflow4_2, up_rflow8_2, up_rmask4_2, up_rmask8_2 = self.decoder_shared(
+            f4w_2, f0_2, f8w_2, up_rflow4_3, up_rflow8_3, up_rmask4_3, up_rmask8_3)
+        up_rflow4_1, up_rflow8_1, up_rmask4_1, up_rmask8_1 = self.decoder_shared(
+            f4w_1, f0_1, f8w_1, up_rflow4_2, up_rflow8_2, up_rmask4_2, up_rmask8_2)
 
-        final_flow0 = up_flow0_1 + up_rflow0_1
+        final_flow4 = up_flow4_1 + up_rflow4_1
         final_flow8 = up_flow8_1 + up_rflow8_1
 
         if input_size != org_size:
             scale_h = org_size[0] / input_size[0]
             scale_w = org_size[1] / input_size[1]
-            final_flow0 = F.interpolate(final_flow0, size=org_size, mode='bilinear', align_corners=False)
-            final_flow0[:, 0, :, :] *= scale_w
-            final_flow0[:, 1, :, :] *= scale_h
+            final_flow4 = F.interpolate(final_flow4, size=org_size, mode='bilinear', align_corners=False)
+            final_flow4[:, 0, :, :] *= scale_w
+            final_flow4[:, 1, :, :] *= scale_h
             final_flow8 = F.interpolate(final_flow8, size=org_size, mode='bilinear', align_corners=False)
             final_flow8[:, 0, :, :] *= scale_w
             final_flow8[:, 1, :, :] *= scale_h
-            up_rmask0_1 = F.interpolate(up_rmask0_1, size=org_size, mode='bilinear', align_corners=False)
+            up_rmask4_1 = F.interpolate(up_rmask4_1, size=org_size, mode='bilinear', align_corners=False)
             up_rmask8_1 = F.interpolate(up_rmask8_1, size=org_size, mode='bilinear', align_corners=False)
 
-        return torch.sigmoid(up_rmask0_1), torch.sigmoid(up_rmask8_1), final_flow0, final_flow8
+        return torch.sigmoid(up_rmask4_1), torch.sigmoid(up_rmask8_1), final_flow4, final_flow8
 
     def forward(self, x, scale_factor=0.5, refine=True):
         img0_c = x[:, 0:4, :, :]
         img4_c = x[:, 16:20, :, :]
         img8_c = x[:, 32:36, :, :]
 
-        mask0, mask8, flow0, flow8 = self.forward_flow_mask(
+        mask4, mask8, flow4, flow8 = self.forward_flow_mask(
             img0_c, img4_c, img8_c, scale_factor=scale_factor)
 
-        img0_warp = warp(img0_c, flow0)
+        img4_warp = warp(img4_c, flow4)
         img8_warp = warp(img8_c, flow8)
 
         img_hdr_m = self.learned_merge(
-            img0_warp[:, :3], img4_c[:, :3], img8_warp[:, :3], mask0, mask8)
+            img4_warp[:, :3], img0_c[:, :3], img8_warp[:, :3], mask4, mask8)
 
         if refine:
             return self.refinenet(img0_c, img4_c, img8_c,
-                                  flow0, flow8, mask0, mask8, img_hdr_m)
+                                  flow4, flow8, mask4, mask8, img_hdr_m)
         else:
             return F.interpolate(img_hdr_m, scale_factor=2,
                                  mode="bilinear", align_corners=False)
@@ -689,7 +689,7 @@ def _print_profile(height=384, width=768, params_cap_m=5.0, flops_cap_g=100.0):
     device = torch.device("cpu")  # macOS compatibility (MPS deform op is often unsupported).
     dummy = torch.ones(1, 36, height, width, device=device)
 
-    model_before = SAFNet_Claude_35().to(device).eval()
+    model_before = SAFNet_Claude_35_v2().to(device).eval()
     model_after = copy.deepcopy(model_before).to(device).eval()
     model_after.fuse_reparam()
 
