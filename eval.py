@@ -159,13 +159,14 @@ def eval_model(
     # ---- Model ----
     model = build_model(model_name)
 
+    # Rep checkpoints are saved from an already-fused model, so the runtime
+    # model must be fused before loading weights.
+    if rep:
+        model.fuse_reparam()
+
     # ---- Load weights ----
     checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     load_model_state_dict(model, checkpoint['state_dict'])
-
-    # ---- Reparameterize / Fuse ----
-    if rep:
-        model.fuse_reparam()
 
     if cuda:
         model = model.cuda()
