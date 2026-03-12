@@ -362,12 +362,12 @@ class LearnedMerge3Frame(nn.Module):
         )
         self.attn_head = nn.Conv2d(48, 3, 1, 1, 0)
 
-    def forward(self, img4_w, img0, img8_w, mask4, mask8):
-        x = torch.cat([img4_w, img0, img8_w, mask4, mask8], dim=1)
+    def forward(self, img0_w, img4, img8_w, mask0, mask8):
+        x = torch.cat([img0_w, img4, img8_w, mask0, mask8], dim=1)
         feat = self.feat_net(x)
         weights = torch.softmax(self.attn_head(feat), dim=1)
-        return (weights[:, 0:1] * img4_w +
-                weights[:, 1:2] * img0 +
+        return (weights[:, 0:1] * img0_w +
+                weights[:, 1:2] * img4 +
                 weights[:, 2:3] * img8_w)
 
 # ======================== RefineNet ========================
@@ -395,16 +395,16 @@ class RefineNet(nn.Module):
         self.conv3 = nn.Conv2d(total_c, 12, 3, 1, 1, bias=True)
         self.pixel_shuffle = nn.PixelShuffle(2)
 
-    def forward(self, img0_c, img4_c, img8_c, flow4, flow8, mask4, mask8, img_hdr_m):
-        feat4 = self.conv0(img4_c)
+    def forward(self, img0_c, img4_c, img8_c, flow0, flow8, mask0, mask8, img_hdr_m):
+        feat0 = self.conv0(img0_c)
         feat1 = self.conv1(torch.cat([
-            img0_c, flow4 / div_flow, flow8 / div_flow,
-            mask4, mask8, img_hdr_m], 1))
+            img4_c, flow0 / div_flow, flow8 / div_flow,
+            mask0, mask8, img_hdr_m], 1))
         feat2 = self.conv2(img8_c)
 
-        feat4_warp = warp(feat4, flow4)
+        feat0_warp = warp(feat0, flow0)
         feat2_warp = warp(feat2, flow8)
-        feat = torch.cat([feat4_warp, feat1, feat2_warp], 1)
+        feat = torch.cat([feat0_warp, feat1, feat2_warp], 1)
 
         feat = self.blocks(feat)
         res = self.pixel_shuffle(self.conv3(feat))
@@ -413,7 +413,7 @@ class RefineNet(nn.Module):
         return torch.clamp(img_hdr_m_up + res, 0, 1)
 
 # ======================== SAFNet_Claude_33 ========================
-class SAFNet_Claude_33(nn.Module):
+class SAFNet_Claude_33_v2(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
@@ -427,7 +427,7 @@ class SAFNet_Claude_33(nn.Module):
                 m.fuse()
 
     def forward_flow_mask(self, img0_c, img4_c, img8_c, scale_factor=0.5):
-        h, w = img0_c.shape[-2:]
+        h, w = img4_c.shape[-2:]
         org_size = (int(h), int(w))
         input_size = (
             int(div_size * np.ceil(h * scale_factor / div_size)),
@@ -442,74 +442,74 @@ class SAFNet_Claude_33(nn.Module):
         f4_1, f4_2, f4_3, f4_4 = self.encoder(img4_c)
         f8_1, f8_2, f8_3, f8_4 = self.encoder(img8_c)
 
-        up_flow4_5 = torch.zeros_like(f0_4[:, 0:2])
-        up_flow8_5 = torch.zeros_like(f0_4[:, 0:2])
-        up_mask4_5 = torch.zeros_like(f0_4[:, 0:1])
-        up_mask8_5 = torch.zeros_like(f0_4[:, 0:1])
+        up_flow0_5 = torch.zeros_like(f4_4[:, 0:2])
+        up_flow8_5 = torch.zeros_like(f4_4[:, 0:2])
+        up_mask0_5 = torch.zeros_like(f4_4[:, 0:1])
+        up_mask8_5 = torch.zeros_like(f4_4[:, 0:1])
 
-        up_flow4_4, up_flow8_4, up_mask4_4, up_mask8_4 = self.decoder(
-            f4_4, f0_4, f8_4, up_flow4_5, up_flow8_5, up_mask4_5, up_mask8_5)
-        up_flow4_3, up_flow8_3, up_mask4_3, up_mask8_3 = self.decoder(
-            f4_3, f0_3, f8_3, up_flow4_4, up_flow8_4, up_mask4_4, up_mask8_4)
-        up_flow4_2, up_flow8_2, up_mask4_2, up_mask8_2 = self.decoder(
-            f4_2, f0_2, f8_2, up_flow4_3, up_flow8_3, up_mask4_3, up_mask8_3)
-        up_flow4_1, up_flow8_1, up_mask4_1, up_mask8_1 = self.decoder(
-            f4_1, f0_1, f8_1, up_flow4_2, up_flow8_2, up_mask4_2, up_mask8_2)
+        up_flow0_4, up_flow8_4, up_mask0_4, up_mask8_4 = self.decoder(
+            f0_4, f4_4, f8_4, up_flow0_5, up_flow8_5, up_mask0_5, up_mask8_5)
+        up_flow0_3, up_flow8_3, up_mask0_3, up_mask8_3 = self.decoder(
+            f0_3, f4_3, f8_3, up_flow0_4, up_flow8_4, up_mask0_4, up_mask8_4)
+        up_flow0_2, up_flow8_2, up_mask0_2, up_mask8_2 = self.decoder(
+            f0_2, f4_2, f8_2, up_flow0_3, up_flow8_3, up_mask0_3, up_mask8_3)
+        up_flow0_1, up_flow8_1, up_mask0_1, up_mask8_1 = self.decoder(
+            f0_1, f4_1, f8_1, up_flow0_2, up_flow8_2, up_mask0_2, up_mask8_2)
 
-        img4_warp_p2 = warp(img4_c, up_flow4_1)
+        img0_warp_p2 = warp(img0_c, up_flow0_1)
         img8_warp_p2 = warp(img8_c, up_flow8_1)
 
-        f4w_1, f4w_2, f4w_3, f4w_4 = self.encoder(img4_warp_p2)
+        f0w_1, f0w_2, f0w_3, f0w_4 = self.encoder(img0_warp_p2)
         f8w_1, f8w_2, f8w_3, f8w_4 = self.encoder(img8_warp_p2)
 
-        up_rflow4_5 = torch.zeros_like(f0_4[:, 0:2])
-        up_rflow8_5 = torch.zeros_like(f0_4[:, 0:2])
-        up_rmask4_5 = torch.zeros_like(f0_4[:, 0:1])
-        up_rmask8_5 = torch.zeros_like(f0_4[:, 0:1])
+        up_rflow0_5 = torch.zeros_like(f4_4[:, 0:2])
+        up_rflow8_5 = torch.zeros_like(f4_4[:, 0:2])
+        up_rmask0_5 = torch.zeros_like(f4_4[:, 0:1])
+        up_rmask8_5 = torch.zeros_like(f4_4[:, 0:1])
 
-        up_rflow4_4, up_rflow8_4, up_rmask4_4, up_rmask8_4 = self.decoder(
-            f4w_4, f0_4, f8w_4, up_rflow4_5, up_rflow8_5, up_rmask4_5, up_rmask8_5)
-        up_rflow4_3, up_rflow8_3, up_rmask4_3, up_rmask8_3 = self.decoder(
-            f4w_3, f0_3, f8w_3, up_rflow4_4, up_rflow8_4, up_rmask4_4, up_rmask8_4)
-        up_rflow4_2, up_rflow8_2, up_rmask4_2, up_rmask8_2 = self.decoder(
-            f4w_2, f0_2, f8w_2, up_rflow4_3, up_rflow8_3, up_rmask4_3, up_rmask8_3)
-        up_rflow4_1, up_rflow8_1, up_rmask4_1, up_rmask8_1 = self.decoder(
-            f4w_1, f0_1, f8w_1, up_rflow4_2, up_rflow8_2, up_rmask4_2, up_rmask8_2)
+        up_rflow0_4, up_rflow8_4, up_rmask0_4, up_rmask8_4 = self.decoder(
+            f0w_4, f4_4, f8w_4, up_rflow0_5, up_rflow8_5, up_rmask0_5, up_rmask8_5)
+        up_rflow0_3, up_rflow8_3, up_rmask0_3, up_rmask8_3 = self.decoder(
+            f0w_3, f4_3, f8w_3, up_rflow0_4, up_rflow8_4, up_rmask0_4, up_rmask8_4)
+        up_rflow0_2, up_rflow8_2, up_rmask0_2, up_rmask8_2 = self.decoder(
+            f0w_2, f4_2, f8w_2, up_rflow0_3, up_rflow8_3, up_rmask0_3, up_rmask8_3)
+        up_rflow0_1, up_rflow8_1, up_rmask0_1, up_rmask8_1 = self.decoder(
+            f0w_1, f4_1, f8w_1, up_rflow0_2, up_rflow8_2, up_rmask0_2, up_rmask8_2)
 
-        final_flow4 = up_flow4_1 + up_rflow4_1
+        final_flow0 = up_flow0_1 + up_rflow0_1
         final_flow8 = up_flow8_1 + up_rflow8_1
 
         if input_size != org_size:
             scale_h = org_size[0] / input_size[0]
             scale_w = org_size[1] / input_size[1]
-            final_flow4 = F.interpolate(final_flow4, size=org_size, mode='bilinear', align_corners=False)
-            final_flow4[:, 0, :, :] *= scale_w
-            final_flow4[:, 1, :, :] *= scale_h
+            final_flow0 = F.interpolate(final_flow0, size=org_size, mode='bilinear', align_corners=False)
+            final_flow0[:, 0, :, :] *= scale_w
+            final_flow0[:, 1, :, :] *= scale_h
             final_flow8 = F.interpolate(final_flow8, size=org_size, mode='bilinear', align_corners=False)
             final_flow8[:, 0, :, :] *= scale_w
             final_flow8[:, 1, :, :] *= scale_h
-            up_rmask4_1 = F.interpolate(up_rmask4_1, size=org_size, mode='bilinear', align_corners=False)
+            up_rmask0_1 = F.interpolate(up_rmask0_1, size=org_size, mode='bilinear', align_corners=False)
             up_rmask8_1 = F.interpolate(up_rmask8_1, size=org_size, mode='bilinear', align_corners=False)
 
-        return torch.sigmoid(up_rmask4_1), torch.sigmoid(up_rmask8_1), final_flow4, final_flow8
+        return torch.sigmoid(up_rmask0_1), torch.sigmoid(up_rmask8_1), final_flow0, final_flow8
 
     def forward(self, x, scale_factor=0.5, refine=True):
         img0_c = x[:, 0:4, :, :]
         img4_c = x[:, 16:20, :, :]
         img8_c = x[:, 32:36, :, :]
 
-        mask4, mask8, flow4, flow8 = self.forward_flow_mask(
+        mask0, mask8, flow0, flow8 = self.forward_flow_mask(
             img0_c, img4_c, img8_c, scale_factor=scale_factor)
 
-        img4_warp = warp(img4_c, flow4)
+        img0_warp = warp(img0_c, flow0)
         img8_warp = warp(img8_c, flow8)
 
         img_hdr_m = self.learned_merge(
-            img4_warp[:, :3], img0_c[:, :3], img8_warp[:, :3], mask4, mask8)
+            img0_warp[:, :3], img4_c[:, :3], img8_warp[:, :3], mask0, mask8)
 
         if refine:
             return self.refinenet(img0_c, img4_c, img8_c,
-                                  flow4, flow8, mask4, mask8, img_hdr_m)
+                                  flow0, flow8, mask0, mask8, img_hdr_m)
         else:
             return F.interpolate(img_hdr_m, scale_factor=2,
                                  mode="bilinear", align_corners=False)
@@ -517,7 +517,7 @@ class SAFNet_Claude_33(nn.Module):
 
 if __name__ == "__main__":
     device = torch.device('cpu')
-    model = SAFNet_Claude_33().to(device)
+    model = SAFNet_Claude_33_v2().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total params: {total_params:,} ({total_params/1e6:.3f}M)")
 
