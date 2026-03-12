@@ -13,10 +13,12 @@ Usage:
   python eval.py --model safnet_claude_5 --exp_name model_cmp_claude5
   python eval.py --model safnet_claude_6 --exp_name model_cmp_claude6 --save_gt
   python eval.py --model safnet_claude_5 --exp_name model_cmp_claude5 --tta
+  python eval.py --model safnet_claude_5 --exp_name model_cmp_claude5 --sliding_window
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import cv2
 import numpy as np
@@ -64,6 +66,119 @@ def tta_forward(model, x):
     return sum(preds) / len(preds)
 
 
+def model_forward(model, x, tta=False):
+    """Run a single inference pass, optionally with D4 TTA."""
+    return tta_forward(model, x) if tta else model(x)
+
+
+def compute_sliding_starts(length, patch_size, stride):
+    """Return patch start offsets that fully cover a dimension."""
+    if patch_size <= 0 or stride <= 0:
+        raise ValueError('patch_size and stride must be positive integers')
+
+    if length <= patch_size:
+        return [0]
+
+    starts = list(range(0, length - patch_size + 1, stride))
+    last_start = length - patch_size
+    if starts[-1] != last_start:
+        starts.append(last_start)
+    return starts
+
+
+def build_blend_weight(patch_h, patch_w, device, dtype, min_weight=1e-3):
+    """Center-weighted window for overlap blending to suppress seam artifacts."""
+    y = torch.linspace(-1.0, 1.0, steps=patch_h, device=device, dtype=dtype)
+    x = torch.linspace(-1.0, 1.0, steps=patch_w, device=device, dtype=dtype)
+    wy = (1.0 - y.abs()).clamp_min(min_weight)
+    wx = (1.0 - x.abs()).clamp_min(min_weight)
+    return torch.outer(wy, wx).unsqueeze(0).unsqueeze(0)
+
+
+def sliding_window_forward(model, x, patch_size=(192, 384), stride=(96, 192), tta=False):
+    """Run inference on overlapping patches and fuse them back into a full image."""
+    patch_h, patch_w = patch_size
+    stride_h, stride_w = stride
+
+    if stride_h >= patch_h or stride_w >= patch_w:
+        raise ValueError(
+            f'stride must be smaller than patch size for overlap, got '
+            f'patch_size={patch_size}, stride={stride}'
+        )
+
+    b, _, h, w = x.shape
+    pad_h = max(0, patch_h - h)
+    pad_w = max(0, patch_w - w)
+    if pad_h or pad_w:
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
+
+    _, _, padded_h, padded_w = x.shape
+    y_starts = compute_sliding_starts(padded_h, patch_h, stride_h)
+    x_starts = compute_sliding_starts(padded_w, patch_w, stride_w)
+
+    pred_acc = None
+    weight_acc = None
+    blend_weight = None
+    scale_h = None
+    scale_w = None
+    target_h = None
+    target_w = None
+
+    for top in y_starts:
+        for left in x_starts:
+            patch = x[:, :, top:top + patch_h, left:left + patch_w]
+            patch_pred = model_forward(model, patch, tta=tta)
+            out_patch_h, out_patch_w = patch_pred.shape[-2:]
+
+            if pred_acc is None:
+                if out_patch_h % patch_h != 0 or out_patch_w % patch_w != 0:
+                    raise ValueError(
+                        'Sliding-window inference requires output spatial size '
+                        'to be an integer multiple of input patch size, got '
+                        f'input patch={patch_size}, output patch='
+                        f'({out_patch_h}, {out_patch_w})'
+                    )
+
+                scale_h = out_patch_h // patch_h
+                scale_w = out_patch_w // patch_w
+                blend_weight = build_blend_weight(
+                    out_patch_h,
+                    out_patch_w,
+                    patch_pred.device,
+                    patch_pred.dtype,
+                )
+                target_h = h * scale_h
+                target_w = w * scale_w
+                pred_acc = torch.zeros(
+                    (b, patch_pred.shape[1], padded_h * scale_h, padded_w * scale_w),
+                    device=patch_pred.device,
+                    dtype=patch_pred.dtype,
+                )
+                weight_acc = torch.zeros(
+                    (1, 1, padded_h * scale_h, padded_w * scale_w),
+                    device=patch_pred.device,
+                    dtype=patch_pred.dtype,
+                )
+            elif patch_pred.shape[-2:] != blend_weight.shape[-2:]:
+                raise ValueError(
+                    'All sliding-window patch predictions must share the same '
+                    f'output size, got {patch_pred.shape[-2:]} vs '
+                    f'{blend_weight.shape[-2:]}'
+                )
+
+            out_top = top * scale_h
+            out_left = left * scale_w
+            pred_acc[:, :, out_top:out_top + out_patch_h, out_left:out_left + out_patch_w] += (
+                patch_pred * blend_weight
+            )
+            weight_acc[:, :, out_top:out_top + out_patch_h, out_left:out_left + out_patch_w] += (
+                blend_weight
+            )
+
+    pred = pred_acc / weight_acc.clamp_min(1e-8)
+    return pred[:, :, :target_h, :target_w]
+
+
 def find_best_checkpoint(checkpoint_dir):
     """Auto-find the best checkpoint in checkpoint_dir.
 
@@ -93,6 +208,9 @@ def eval_model(
     save_input=False,
     tta=False,
     rep=False,
+    sliding_window=False,
+    patch_size=(192, 384),
+    stride=None,
 ):
     """Evaluate a model on the validation set and save output TIF images.
 
@@ -107,11 +225,18 @@ def eval_model(
         save_input: Also save per-frame input images
         tta: Enable 8-fold D4 test-time augmentation
     """
+    if stride is None:
+        stride = (patch_size[0] // 2, patch_size[1] // 2)
+
     print(f'=== Evaluation: {model_name} (exp: {exp_name}) ===')
     if rep:
         print(f'    Rep: enabled (using reparameterized model)')
     if tta:
         print(f'    TTA: enabled (8-fold D4 geometric ensemble)')
+    if sliding_window:
+        print(f'    Sliding window: enabled')
+        print(f'    Patch size: {patch_size[0]}x{patch_size[1]}')
+        print(f'    Stride: {stride[0]}x{stride[1]}')
     print()
 
     # ---- Resolve checkpoint directory ----
@@ -213,7 +338,16 @@ def eval_model(
             b, f, c, h, w = burst_noise.shape
             burst_noise = burst_noise.view(b, f * c, h, w)
 
-            pred = tta_forward(model, burst_noise) if tta else model(burst_noise)
+            if sliding_window:
+                pred = sliding_window_forward(
+                    model,
+                    burst_noise,
+                    patch_size=patch_size,
+                    stride=stride,
+                    tta=tta,
+                )
+            else:
+                pred = model_forward(model, burst_noise, tta=tta)
             pred = torch.clamp(pred, 0.0, 1.0)
 
             t1 = time.time()
@@ -331,6 +465,14 @@ if __name__ == '__main__':
                         help='Enable 8-fold D4 test-time augmentation (flip+rot90)')
     parser.add_argument('--rep', action='store_true',
                         help='Use reparameterized model (load model_best_rep.pth.tar)')
+    parser.add_argument('--sliding_window', action='store_true',
+                        help='Run inference on overlapping patches and blend them')
+    parser.add_argument('--patch_size', type=int, nargs=2, metavar=('H', 'W'),
+                        default=(192, 384),
+                        help='Sliding window patch size as H W (default: 192 384)')
+    parser.add_argument('--stride', type=int, nargs=2, metavar=('H', 'W'),
+                        default=None,
+                        help='Sliding window stride as H W (default: patch_size/2)')
     args = parser.parse_args()
 
     eval_model(
@@ -344,4 +486,7 @@ if __name__ == '__main__':
         save_input=args.save_input,
         tta=args.tta,
         rep=args.rep,
+        sliding_window=args.sliding_window,
+        patch_size=tuple(args.patch_size),
+        stride=tuple(args.stride) if args.stride is not None else None,
     )

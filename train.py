@@ -37,6 +37,10 @@ def train(
     cuda,
     restart_train,
     mGPU,
+    num_workers=4,
+    val_every=1,
+    cudnn_benchmark=False,
+    compile_model=False,
     model_name='unet',
     exp_name='default',
     train_root="/home/chen/data/ntire2026/hdr/train/",
@@ -66,9 +70,13 @@ def train(
     consist_weight=0.1,
 ):
     torch.set_num_threads(num_threads)
+    if val_every <= 0:
+        raise ValueError(f"val_every must be >= 1, got {val_every}")
 
     use_amp = cuda  # 混合精度训练，加速并减显存
     exp_name = (exp_name or "default").strip().replace(" ", "_")
+    if cuda:
+        torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
 
     # checkpoint path（不同模型使用不同目录）
     checkpoint_dir = f'./checkpoint_dir/checkpoint_dir_{model_name}_{exp_name}'
@@ -127,13 +135,12 @@ def train(
     #num_workers = num_threads
 
     def build_train_loader(curr_batch_size):
-        return torch.utils.data.DataLoader(
-            train_set,
+        loader_kwargs = dict(
+            dataset=train_set,
             batch_size=curr_batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=num_workers,
             pin_memory=cuda,
-            persistent_workers=(4 > 0),
             collate_fn=make_train_collate(
                 train_aug,
                 aug_crop_sizes,
@@ -142,6 +149,11 @@ def train(
                 consist_enable=consist_enable,
                 consist_sizes=consist_sizes,
             ) if use_batch_collate or consist_enable else None,
+        )
+        if num_workers > 0:
+            loader_kwargs['persistent_workers'] = True
+        return torch.utils.data.DataLoader(
+            **loader_kwargs,
         )
 
     # 验证集（每个 epoch 后计算 PSNR/SSIM）
@@ -153,14 +165,16 @@ def train(
         augment=None,
         finalize_inputs=True,
     )
-    val_loader = torch.utils.data.DataLoader(
-        val_set,
+    val_loader_kwargs = dict(
+        dataset=val_set,
         batch_size=1,
         shuffle=False,
-        num_workers=1,
+        num_workers=num_workers,
         pin_memory=cuda,
-        persistent_workers=True,
     )
+    if num_workers > 0:
+        val_loader_kwargs['persistent_workers'] = True
+    val_loader = torch.utils.data.DataLoader(**val_loader_kwargs)
     print("Val loader length:", len(val_loader))
 
     # 模型选择
@@ -177,9 +191,12 @@ def train(
         model = model.cuda()
         loss_fn = loss_fn.cuda()
 
-    # # torch.compile 加速训练（PyTorch 2.0+）
-    # model = torch.compile(model)
-    # print('=> torch.compile enabled')
+    if compile_model:
+        if hasattr(torch, 'compile'):
+            model = torch.compile(model)
+            print('=> torch.compile enabled')
+        else:
+            print('=> torch.compile requested but unavailable in this PyTorch build')
 
     if mGPU:
         model = nn.DataParallel(model)
@@ -219,6 +236,11 @@ def train(
         f"geo={aug_geo_enable}(flip={aug_geo_flip_enable}, rot90={aug_geo_rot90_enable})"
     )
     print(f"=> Train batch: {batch_desc}")
+    print(
+        f"=> Runtime: num_workers={num_workers}, val_every={val_every}, "
+        f"cudnn_benchmark={bool(cuda and cudnn_benchmark)}, compile={bool(compile_model)}, "
+        f"mgpu={mGPU}"
+    )
 
     crop_controller.set_epoch(start_epoch, n_epoch)
     current_batch_size = crop_controller.current_batch_size()
@@ -248,16 +270,21 @@ def train(
         global_step += step_count
         epoch_time = time.time() - epoch_start_time
 
-        # 验证集评估（使用 EMA 权重）
-        if ema is not None:
-            ema.apply(model)
-        val_psnr, val_ssim = validate(model, val_loader, use_amp, cuda)
-        if ema is not None:
-            ema.restore(model)
-
-        # 打印 epoch 总结
-        print(f'\n[Epoch {epoch:04d}] Time: {epoch_time:.1f}s | Train Loss: {avg_train_loss:.5f} | '
-              f'Val PSNR: {val_psnr:.3f} dB | Val SSIM: {val_ssim:.4f}\n')
+        should_validate = ((epoch + 1) % val_every == 0) or (epoch == n_epoch - 1)
+        if should_validate:
+            # 验证集评估（使用 EMA 权重）
+            if ema is not None:
+                ema.apply(model)
+            val_psnr, val_ssim = validate(model, val_loader, use_amp, cuda)
+            if ema is not None:
+                ema.restore(model)
+            print(f'\n[Epoch {epoch:04d}] Time: {epoch_time:.1f}s | Train Loss: {avg_train_loss:.5f} | '
+                  f'Val PSNR: {val_psnr:.3f} dB | Val SSIM: {val_ssim:.4f}\n')
+        else:
+            val_psnr = float('nan')
+            val_ssim = float('nan')
+            print(f'\n[Epoch {epoch:04d}] Time: {epoch_time:.1f}s | Train Loss: {avg_train_loss:.5f} | '
+                  f'Val: skipped (val_every={val_every})\n')
 
         # 保存当前 epoch 的 loss / PSNR / SSIM 到 output_log（txt 格式，文件名带时间戳）
         with open(log_txt_path, 'a', encoding='utf-8') as f:
@@ -270,7 +297,7 @@ def train(
             )
 
         # 基于 val PSNR 判断 is_best（而非 train loss，避免增广实验偏置）
-        if val_psnr > best_psnr:
+        if should_validate and val_psnr > best_psnr:
             is_best = True
             best_psnr = val_psnr
         else:
@@ -310,8 +337,15 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--lr_decay', type=float, default=0.95)
     parser.add_argument('--num_threads', type=int, default=2)
+    parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--cuda', type=int, default=1)
-    parser.add_argument('--mgpu', type=int, default=1)
+    parser.add_argument('--mgpu', type=int, default=0)
+    parser.add_argument('--val_every', type=int, default=1,
+                        help='Run validation every N epochs')
+    parser.add_argument('--cudnn_benchmark', type=int, default=0,
+                        help='Enable torch.backends.cudnn.benchmark (0/1)')
+    parser.add_argument('--compile', dest='compile_model', type=int, default=0,
+                        help='Enable torch.compile when available (0/1)')
     parser.add_argument('--restart_train', type=int, default=1)
     parser.add_argument('--pretrained', type=str, default=None,
                         help='Path to pretrained checkpoint for transfer learning (partial weight loading)')
@@ -351,9 +385,13 @@ if __name__ == '__main__':
 
     train(
         num_threads=args.num_threads,
+        num_workers=args.num_workers,
         cuda=bool(args.cuda),
         restart_train=bool(args.restart_train),
         mGPU=bool(args.mgpu),
+        val_every=args.val_every,
+        cudnn_benchmark=bool(args.cudnn_benchmark),
+        compile_model=bool(args.compile_model),
         model_name=args.model,
         exp_name=args.exp_name,
         train_root=args.train_root,

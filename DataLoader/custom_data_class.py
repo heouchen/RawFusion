@@ -3,6 +3,7 @@ import torchvision.transforms as transforms
 import os
 import cv2
 import numpy as np
+from tqdm import tqdm
 from typing import Optional, List, Tuple
 
 
@@ -186,20 +187,36 @@ class CustomDataset(torch.utils.data.Dataset):
         gt_scene_ids = sorted(
             int(f.split("-")[1]) for f in all_files if f.endswith("-gt.tif")
         )
-
+        self.input_only_mode = len(gt_scene_ids) == 0
         self.samples = []
-        if len(gt_scene_ids) > 0:
-            # 标准模式：需要 GT
+        self.cache = []
+        if not self.input_only_mode:
             self.scene_ids = gt_scene_ids
             n_scenes = len(self.scene_ids)
             print(f"Found {n_scenes} scenes in {self.root_dir}")
-            for scene_id in self.scene_ids:
-                input_paths = [
-                    f"{self.root_dir}Scene-{scene_id:03d}-in-{i}.tif"
-                    for i in range(9)
-                ]
+            for scene_id in tqdm(
+                self.scene_ids,
+                desc="Loading dataset and packing Bayer",
+                ncols=80,
+            ):
+                input_tensors = []
+                for i in range(9):
+                    img_path = f"{self.root_dir}Scene-{scene_id:03d}-in-{i}.tif"
+                    arr = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+                    if arr is None:
+                        raise FileNotFoundError(f"Cannot read: {img_path}")
+                    input_tensors.append(pack_raw_bayer(arr))
+
                 gt_path = f"{self.root_dir}Scene-{scene_id:03d}-gt.tif"
-                self.samples.append((input_paths, gt_path))
+                gt_arr = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED)
+                if gt_arr is None:
+                    raise FileNotFoundError(f"Cannot read: {gt_path}")
+
+                inputs = torch.stack(input_tensors, dim=0)
+                target = to_float_tensor(gt_arr)
+                self.cache.append((inputs, target))
+
+            print(f"Cached {len(self.cache)} scenes in memory.")
         else:
             # ----- 2) 兼容「无 GT、仅输入」的推理模式 -----
             # 约定：存在 Scene-XXX-in-0.tif 即认为是一个 scene
@@ -219,35 +236,37 @@ class CustomDataset(torch.utils.data.Dataset):
                     f"{self.root_dir}Scene-{scene_id:03d}-in-{i}.tif"
                     for i in range(9)
                 ]
-                # 无 GT：用 None 占位
                 self.samples.append((input_paths, None))
 
     def __len__(self):
-        return len(self.samples)
+        if self.input_only_mode:
+            return len(self.samples)
+        return len(self.cache)
 
     def __getitem__(self, idx):
-        input_paths, gt_path = self.samples[idx]
-        input_tensors = []
-        for img_path in input_paths:
-            arr = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-            if arr is None:
-                raise FileNotFoundError(f"Cannot read: {img_path}")
-            input_tensors.append(pack_raw_bayer(arr))
+        if self.input_only_mode:
+            input_paths, gt_path = self.samples[idx]
+            input_tensors = []
+            for img_path in input_paths:
+                arr = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+                if arr is None:
+                    raise FileNotFoundError(f"Cannot read: {img_path}")
+                input_tensors.append(pack_raw_bayer(arr))
 
-        inputs = torch.stack(input_tensors, dim=0)
+            inputs = torch.stack(input_tensors, dim=0)
 
-        # ---- 推理「仅输入」模式：没有 GT，直接返回 inputs ----
-        if gt_path is None:
-            if self.finalize_inputs:
-                inputs = finalize_input_tensor(inputs)
-            return inputs
+            # 推理模式没有 GT，直接返回 burst 输入
+            if gt_path is None:
+                if self.finalize_inputs:
+                    inputs = finalize_input_tensor(inputs)
+                return inputs
 
-        # ---- 标准「有 GT」模式 ----
-        gt_arr = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED)
-        if gt_arr is None:
-            raise FileNotFoundError(f"Cannot read: {gt_path}")
-
-        target = to_float_tensor(gt_arr)
+            gt_arr = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED)
+            if gt_arr is None:
+                raise FileNotFoundError(f"Cannot read: {gt_path}")
+            target = to_float_tensor(gt_arr)
+        else:
+            inputs, target = self.cache[idx]
         if self.train and (self.augment is not None):
             inputs, target = self.augment(inputs, target)
             if self.augment.clamp:

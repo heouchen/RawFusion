@@ -5,6 +5,7 @@ from models.SAFNet_Claude_30 import SAFNet_Claude_30
 from models.SAFNet_Claude_31 import SAFNet_Claude_31
 from models.SAFNet_Claude_32 import SAFNet_Claude_32
 from models.SAFNet_Claude_33 import SAFNet_Claude_33
+from models.SAFNet_Claude_33_v2 import SAFNet_Claude_33_v2
 from models.SAFNet_Claude_34 import SAFNet_Claude_34
 from models.SAFNet_Claude_35 import SAFNet_Claude_35
 from models.SAFNet_Claude_35_v2 import SAFNet_Claude_35_v2
@@ -37,6 +38,7 @@ _MODEL_MAP = {
     'safnet_claude_31': SAFNet_Claude_31,
     'safnet_claude_32': SAFNet_Claude_32,
     'safnet_claude_33': SAFNet_Claude_33,
+    'safnet_claude_33_v2': SAFNet_Claude_33_v2,
     'safnet_claude_34': SAFNet_Claude_34,
     'safnet_claude_35': SAFNet_Claude_35,
     'safnet_claude_35_v2': SAFNet_Claude_35_v2,
