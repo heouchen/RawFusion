@@ -194,7 +194,7 @@ def train(
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
     optimizer.zero_grad()
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(n_epoch - 1, 1), eta_min=1e-6)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(n_epoch - 1, 1), eta_min=1e-5)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     start_epoch, global_step, best_psnr, log_txt_path, log_header_written = resume_or_load(

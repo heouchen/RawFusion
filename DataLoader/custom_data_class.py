@@ -181,19 +181,46 @@ class CustomDataset(torch.utils.data.Dataset):
         self.finalize_inputs = bool(finalize_inputs)
 
         all_files = os.listdir(self.root_dir)
-        self.scene_ids = sorted(
+
+        # ----- 1) 先尝试标准「有 GT」模式 -----
+        gt_scene_ids = sorted(
             int(f.split("-")[1]) for f in all_files if f.endswith("-gt.tif")
         )
-        n_scenes = len(self.scene_ids)
-        print(f"Found {n_scenes} scenes in {self.root_dir}")
+
         self.samples = []
-        for scene_id in self.scene_ids:
-            input_paths = [
-                f"{self.root_dir}Scene-{scene_id:03d}-in-{i}.tif"
-                for i in range(9)
-            ]
-            gt_path = f"{self.root_dir}Scene-{scene_id:03d}-gt.tif"
-            self.samples.append((input_paths, gt_path))
+        if len(gt_scene_ids) > 0:
+            # 标准模式：需要 GT
+            self.scene_ids = gt_scene_ids
+            n_scenes = len(self.scene_ids)
+            print(f"Found {n_scenes} scenes in {self.root_dir}")
+            for scene_id in self.scene_ids:
+                input_paths = [
+                    f"{self.root_dir}Scene-{scene_id:03d}-in-{i}.tif"
+                    for i in range(9)
+                ]
+                gt_path = f"{self.root_dir}Scene-{scene_id:03d}-gt.tif"
+                self.samples.append((input_paths, gt_path))
+        else:
+            # ----- 2) 兼容「无 GT、仅输入」的推理模式 -----
+            # 约定：存在 Scene-XXX-in-0.tif 即认为是一个 scene
+            input_scene_ids = sorted(
+                int(f.split("-")[1])
+                for f in all_files
+                if f.endswith("-in-0.tif")
+            )
+            self.scene_ids = input_scene_ids
+            n_scenes = len(self.scene_ids)
+            print(
+                f"Found {n_scenes} scenes in {self.root_dir} "
+                f"(input-only, no GT files)"
+            )
+            for scene_id in self.scene_ids:
+                input_paths = [
+                    f"{self.root_dir}Scene-{scene_id:03d}-in-{i}.tif"
+                    for i in range(9)
+                ]
+                # 无 GT：用 None 占位
+                self.samples.append((input_paths, None))
 
     def __len__(self):
         return len(self.samples)
@@ -207,11 +234,19 @@ class CustomDataset(torch.utils.data.Dataset):
                 raise FileNotFoundError(f"Cannot read: {img_path}")
             input_tensors.append(pack_raw_bayer(arr))
 
+        inputs = torch.stack(input_tensors, dim=0)
+
+        # ---- 推理「仅输入」模式：没有 GT，直接返回 inputs ----
+        if gt_path is None:
+            if self.finalize_inputs:
+                inputs = finalize_input_tensor(inputs)
+            return inputs
+
+        # ---- 标准「有 GT」模式 ----
         gt_arr = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED)
         if gt_arr is None:
             raise FileNotFoundError(f"Cannot read: {gt_path}")
 
-        inputs = torch.stack(input_tensors, dim=0)
         target = to_float_tensor(gt_arr)
         if self.train and (self.augment is not None):
             inputs, target = self.augment(inputs, target)

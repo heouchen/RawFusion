@@ -187,15 +187,27 @@ def eval_model(
     psnr_total = 0.0
     ssim_total = 0.0
     time_total = 0.0
+    n_metric_scenes = 0  # number of scenes that actually have GT
 
     with torch.no_grad():
-        for i, (burst_noise, gt) in enumerate(val_loader):
+        for i, batch in enumerate(val_loader):
+            # 支持既可以返回 (burst_noise, gt)，也可以只返回 burst_noise 的数据集
+            if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                burst_noise, gt = batch
+                has_gt = True
+            else:
+                # batch 可能是单个 tensor，或长度为 1 的 tuple/list
+                burst_noise = batch[0] if isinstance(batch, (list, tuple)) else batch
+                gt = None
+                has_gt = False
+
             scene_id = scene_ids[i]
             t0 = time.time()
 
             if cuda:
                 burst_noise = burst_noise.cuda(non_blocking=True)
-                gt = gt.cuda(non_blocking=True)
+                if gt is not None:
+                    gt = gt.cuda(non_blocking=True)
 
             # burst_noise: (B, 9, 4, H, W) -> (B, 36, H, W)
             b, f, c, h, w = burst_noise.shape
@@ -208,14 +220,19 @@ def eval_model(
             elapsed = t1 - t0
             time_total += elapsed
 
-            # Compute metrics
-            psnr_val = calculate_psnr(pred.unsqueeze(1), gt.unsqueeze(1))
-            ssim_val = calculate_ssim(pred.unsqueeze(1), gt.unsqueeze(1))
-            psnr_total += psnr_val
-            ssim_total += ssim_val
+            # Compute metrics（如果有 GT）
+            if gt is not None:
+                psnr_val = calculate_psnr(pred.unsqueeze(1), gt.unsqueeze(1))
+                ssim_val = calculate_ssim(pred.unsqueeze(1), gt.unsqueeze(1))
+                psnr_total += psnr_val
+                ssim_total += ssim_val
+                n_metric_scenes += 1
 
-            print(f'Scene-{scene_id:03d} | PSNR: {psnr_val:.2f} dB | '
-                  f'SSIM: {ssim_val:.4f} | time: {elapsed:.2f}s')
+                print(f'Scene-{scene_id:03d} | PSNR: {psnr_val:.2f} dB | '
+                      f'SSIM: {ssim_val:.4f} | time: {elapsed:.2f}s')
+            else:
+                # 没有 GT，仅打印时间信息
+                print(f'Scene-{scene_id:03d} | time: {elapsed:.2f}s (no GT)')
 
             # ---- Save output as 96-bit TIF (float32 x 3ch) ----
             # Data pipeline: cv2.imread(BGR) -> ToTensor(BGR CHW) -> model(BGR CHW)
@@ -241,28 +258,39 @@ def eval_model(
                     cv2.imwrite(inp_path, frame_np)
 
     n_scenes = len(val_loader)
-    avg_psnr = psnr_total / n_scenes
-    avg_ssim = ssim_total / n_scenes
+    avg_psnr = psnr_total / n_metric_scenes if n_metric_scenes > 0 else None
+    avg_ssim = ssim_total / n_metric_scenes if n_metric_scenes > 0 else None
 
     print(f'\n--- Results ---')
-    print(f'Average PSNR: {avg_psnr:.2f} dB')
-    print(f'Average SSIM: {avg_ssim:.4f}')
-    print(f'Total time:   {time_total:.2f}s ({time_total / n_scenes:.2f}s/scene)')
+    if n_metric_scenes > 0:
+        print(f'Average PSNR: {avg_psnr:.2f} dB (on {n_metric_scenes} scenes with GT)')
+        print(f'Average SSIM: {avg_ssim:.4f} (on {n_metric_scenes} scenes with GT)')
+    else:
+        print('Average PSNR: N/A (no GT provided)')
+        print('Average SSIM: N/A (no GT provided)')
+
+    if n_scenes > 0:
+        print(f'Total time:   {time_total:.2f}s ({time_total / n_scenes:.2f}s/scene)')
+    else:
+        print(f'Total time:   {time_total:.2f}s (no scenes)')
     print(f'Output saved: {img_dir}')
 
     # ---- Verify output format ----
-    sample_out = os.path.join(img_dir, f'Scene-{scene_ids[0]:03d}-out.tif')
-    verify = cv2.imread(sample_out, cv2.IMREAD_UNCHANGED)
-    if verify is not None:
-        print(f'\n=> Output format check: shape={verify.shape}, '
-              f'dtype={verify.dtype}, '
-              f'bits={verify.dtype.itemsize * 8 * verify.shape[2]}bit '
-              f'({verify.dtype.itemsize * 8}bit x {verify.shape[2]}ch)')
-        assert verify.dtype == np.float32, \
-            f'ERROR: expected float32, got {verify.dtype}'
-        assert len(verify.shape) == 3 and verify.shape[2] == 3, \
-            f'ERROR: expected 3-channel, got shape {verify.shape}'
-        print('=> Format OK: 96-bit depth (32bit x 3ch) float32 TIF')
+    # 仅在存在至少一个 scene / 输出文件时才做检查
+    if len(scene_ids) > 0:
+        sample_out = os.path.join(img_dir, f'Scene-{scene_ids[0]:03d}-out.tif')
+        if os.path.exists(sample_out):
+            verify = cv2.imread(sample_out, cv2.IMREAD_UNCHANGED)
+            if verify is not None:
+                print(f'\n=> Output format check: shape={verify.shape}, '
+                      f'dtype={verify.dtype}, '
+                      f'bits={verify.dtype.itemsize * 8 * verify.shape[2]}bit '
+                      f'({verify.dtype.itemsize * 8}bit x {verify.shape[2]}ch)')
+                assert verify.dtype == np.float32, \
+                    f'ERROR: expected float32, got {verify.dtype}'
+                assert len(verify.shape) == 3 and verify.shape[2] == 3, \
+                    f'ERROR: expected 3-channel, got shape {verify.shape}'
+                print('=> Format OK: 96-bit depth (32bit x 3ch) float32 TIF')
 
     # ---- Pack all images into result.zip ----
     zip_path = os.path.join(checkpoint_dir, 'result.zip')
@@ -288,7 +316,7 @@ if __name__ == '__main__':
     parser.add_argument('--exp_name', type=str, default='default',
                         help='Experiment name (must match training exp_name)')
     parser.add_argument('--val_root', type=str,
-                        default='/home/chen/data/ntire2026/hdr/validation/',
+                        default='/home/chen/data/ntire2026/hdr/test/',
                         help='Path to validation data')
     parser.add_argument('--checkpoint_dir', type=str,
                         default='./checkpoint_dir',
