@@ -16,7 +16,7 @@ set -euo pipefail
 #
 # 可选环境变量覆盖默认值:
 #   EPOCHS=200 BATCH_SIZE=1 CUDA=0 bash scripts/run_model_comparison.sh
-#   bash scripts/run.sh --gpu 0 --num_workers 16 --val_every 50 --cudnn_benchmark 1 --compile 1
+#   bash scripts/run.sh --gpu 0 --num_workers 16 --val_every 10 --cudnn_benchmark 1 --compile 1
 # ==============================================================================
 
 # Parse command line arguments
@@ -58,13 +58,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Data Paths
-TRAIN_ROOT="${TRAIN_ROOT:-/root/work/data/hdr/train/}"
-VAL_ROOT="${VAL_ROOT:-/root/work/data/hdr/validation/}"
+TRAIN_ROOT="${TRAIN_ROOT:-/home/chen/data/ntire2026/hdr/train/}"
+VAL_ROOT="${VAL_ROOT:-/home/chen/data/ntire2026/hdr/validation/}"
 
 # Training Hyperparameters (所有实验保持一致)
-EPOCHS="${EPOCHS:-5000}"
-BATCH_SIZE="${BATCH_SIZE:-10}"
-LR="${LR:-2e-4}"
+EPOCHS="${EPOCHS:-300}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+LR="${LR:-1e-4}"
 LR_DECAY="${LR_DECAY:-0.95}"
 CUDA="${CUDA:-1}"
 MGPU="${MGPU:-0}"
@@ -76,7 +76,7 @@ COMPILE="${COMPILE:-0}"
 
 # 固定增广策略（crop + geo）
 # Baseline: 随机多尺度 crop
-CROP_SIZES="256x256"
+CROP_SIZES="512x512"
 PROGRESSIVE_CROP_ENABLE="${PROGRESSIVE_CROP_ENABLE:-0}"
 PROGRESSIVE_CROP_SCHEDULE="${PROGRESSIVE_CROP_SCHEDULE:-96x192@0.3,192x384@0.7,384x768@1.0}"
 PROGRESSIVE_BATCH_ENABLE="${PROGRESSIVE_BATCH_ENABLE:-0}"
@@ -156,9 +156,11 @@ run_one () {
 # run_one "safnet_claude_31" "model_submit_claude31"
 # run_one "safnet_claude_32" "model_submit_claude32"
 # run_one "safnet_claude_33" "model_submit_claude33"
+pretrained="/home/chen/work/RawFusion/checkpoint_dir/checkpoint_dir_safnet_claude_33_v2_model_submit_claude33_v2/model_best.pth.tar"
+run_one "safnet_claude_33_v2" "model_submit_claude33_v2"
 # run_one "safnet_claude_34" "model_submit_claude34"
 # run_one "safnet_claude_35" "model_submit_claude35"
-run_one "safnet_claude_35_v2" "model_submit_claude35_v2"
+# run_one "safnet_claude_35_v2" "model_submit_claude35_v2"
 # run_one "safnet_claude_36" "model_submit_claude36"
 # run_one "safnet_claude_37" "model_submit_claude37"
 # run_one "safnet_claude_38" "model_submit_claude38"

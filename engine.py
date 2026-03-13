@@ -131,8 +131,8 @@ def validate(model, val_loader, use_amp, cuda):
     # Training-time validation uses a fixed center crop so the validation input
     # matches the train crop size. Remove or parameterize this block if you want
     # full-image validation again.
-    val_crop_h = 256
-    val_crop_w = 256
+    val_crop_h = 512
+    val_crop_w = 512
 
     with torch.no_grad():
         val_pbar = tqdm(val_loader, desc='Validation', ncols=100, leave=False)

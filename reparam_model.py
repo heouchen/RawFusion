@@ -7,6 +7,18 @@ import copy
 
 from models import build_model
 
+
+def _strip_prefixes(key, prefixes):
+    """Remove any known prefixes (e.g., module./_orig_mod.) from a key."""
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                changed = True
+    return key
+
 def _format_count(num):
     if num >= 1e12:
         return f"{num / 1e12:.3f}T"
@@ -56,8 +68,12 @@ def reparam(model_name, exp_name, checkpoint_dir_root='./checkpoint_dir',
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     state_dict = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
 
-    # Remove 'module.' prefix if present
-    new_state_dict = {k[7:] if k.startswith('module.') else k: v for k, v in state_dict.items()}
+    # Remove prefixes introduced by DataParallel / torch.compile
+    prefix_whitelist = ('module.', '_orig_mod.')
+    new_state_dict = {
+        _strip_prefixes(k, prefix_whitelist): v
+        for k, v in state_dict.items()
+    }
     model.load_state_dict(new_state_dict)
     model.eval()
 

@@ -450,7 +450,7 @@ if __name__ == '__main__':
     parser.add_argument('--exp_name', type=str, default='default',
                         help='Experiment name (must match training exp_name)')
     parser.add_argument('--val_root', type=str,
-                        default='/home/chen/data/ntire2026/hdr/test/',
+                        default='/home/chen/data/ntire2026/hdr/validation/',
                         help='Path to validation data')
     parser.add_argument('--checkpoint_dir', type=str,
                         default='./checkpoint_dir',
@@ -468,7 +468,7 @@ if __name__ == '__main__':
     parser.add_argument('--sliding_window', action='store_true',
                         help='Run inference on overlapping patches and blend them')
     parser.add_argument('--patch_size', type=int, nargs=2, metavar=('H', 'W'),
-                        default=(192, 384),
+                        default=(256, 256),
                         help='Sliding window patch size as H W (default: 192 384)')
     parser.add_argument('--stride', type=int, nargs=2, metavar=('H', 'W'),
                         default=None,

@@ -267,6 +267,9 @@ class CustomDataset(torch.utils.data.Dataset):
             target = to_float_tensor(gt_arr)
         else:
             inputs, target = self.cache[idx]
+            # clone cached tensors before any in-place ops (augment/finalize)
+            inputs = inputs.clone()
+            target = target.clone()
         if self.train and (self.augment is not None):
             inputs, target = self.augment(inputs, target)
             if self.augment.clamp:

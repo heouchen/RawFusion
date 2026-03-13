@@ -47,38 +47,54 @@ def load_checkpoint(checkpoint_dir, best_or_latest='best'):
     return torch.load(checkpoint_file, map_location='cpu', weights_only=False)
 
 
+def _strip_state_dict_prefixes(state_dict, prefixes):
+    """Remove known prefixes (e.g., module./_orig_mod.) from every key in the state dict."""
+    if not prefixes:
+        return state_dict
+
+    def _strip(key):
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    key = key[len(prefix):]
+                    changed = True
+        return key
+
+    return {_strip(k): v for k, v in state_dict.items()}
+
+
+def _unwrap_model(model):
+    """Peel off wrappers like DataParallel or torch.compile OptimizedModule."""
+    base = model
+    while True:
+        if isinstance(base, nn.DataParallel):
+            base = base.module
+            continue
+        if hasattr(base, '_orig_mod'):
+            base = base._orig_mod
+            continue
+        break
+    return base
+
+
 def load_model_state_dict(model, state_dict):
     """加载 state_dict，自动处理 DataParallel 的 module. 前缀不匹配问题"""
-    try:
-        model.load_state_dict(state_dict)
-    except RuntimeError:
-        # checkpoint 有 module. 前缀但当前模型没有，或反过来
-        is_parallel = isinstance(model, nn.DataParallel)
-        ckpt_has_module = any(k.startswith('module.') for k in state_dict.keys())
-        if is_parallel and not ckpt_has_module:
-            # 模型是 DataParallel 但 checkpoint 没有 module. 前缀
-            new_sd = {'module.' + k: v for k, v in state_dict.items()}
-            model.load_state_dict(new_sd)
-        elif not is_parallel and ckpt_has_module:
-            # 模型不是 DataParallel 但 checkpoint 有 module. 前缀
-            new_sd = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
-            model.load_state_dict(new_sd)
-        else:
-            raise
+    base_model = _unwrap_model(model)
+    cleaned_sd = _strip_state_dict_prefixes(state_dict, ('module.', '_orig_mod.'))
+    base_model.load_state_dict(cleaned_sd)
 
 
 def load_pretrained_weights(model, path):
     """从预训练模型加载权重（支持跨模型迁移，只加载匹配的key）"""
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     pretrained_sd = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
-    # 去除 module. 前缀
-    cleaned_sd = {}
-    for k, v in pretrained_sd.items():
-        new_k = k.replace('module.', '', 1) if k.startswith('module.') else k
-        cleaned_sd[new_k] = v
-    # 获取当前模型的 state_dict（去 module. 前缀）
-    is_parallel = isinstance(model, nn.DataParallel)
-    current_sd = model.module.state_dict() if is_parallel else model.state_dict()
+    # 去除常见包装产生的前缀
+    cleaned_sd = _strip_state_dict_prefixes(pretrained_sd, ('module.', '_orig_mod.'))
+    # 获取当前模型（去除 DataParallel/compile 包装）
+    base_model = _unwrap_model(model)
+    current_sd = base_model.state_dict()
     # 只加载 shape 匹配的 key
     loaded_keys = []
     skipped_keys = []
@@ -88,10 +104,7 @@ def load_pretrained_weights(model, path):
             loaded_keys.append(k)
         else:
             skipped_keys.append(k)
-    if is_parallel:
-        model.module.load_state_dict(current_sd)
-    else:
-        model.load_state_dict(current_sd)
+    base_model.load_state_dict(current_sd)
     print(f'=> loaded pretrained weights from {path}')
     print(f'   loaded {len(loaded_keys)} keys, skipped {len(skipped_keys)} keys')
     if skipped_keys:
