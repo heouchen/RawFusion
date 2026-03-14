@@ -46,7 +46,8 @@ python eval.py \
     --model "${MODEL}" \
     --exp_name "${EXP}" \
     --tta \
-    --rep
+    --rep \
+    --sliding_window
 
 echo ""
 echo "======================================================"

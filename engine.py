@@ -131,8 +131,8 @@ def validate(model, val_loader, use_amp, cuda):
     # Training-time validation uses a fixed center crop so the validation input
     # matches the train crop size. Remove or parameterize this block if you want
     # full-image validation again.
-    val_crop_h = 512
-    val_crop_w = 512
+    # val_crop_h = 512
+    # val_crop_w = 512
 
     with torch.no_grad():
         val_pbar = tqdm(val_loader, desc='Validation', ncols=100, leave=False)
@@ -141,23 +141,23 @@ def validate(model, val_loader, use_amp, cuda):
                 burst_noise = burst_noise.cuda(non_blocking=True)
                 gt = gt.cuda(non_blocking=True)
 
-            b, f, c, h, w = burst_noise.shape
-            if h >= val_crop_h and w >= val_crop_w:
-                crop_top = (h - val_crop_h) // 2
-                crop_left = (w - val_crop_w) // 2
-                burst_noise = burst_noise[
-                    :,
-                    :,
-                    :,
-                    crop_top:crop_top + val_crop_h,
-                    crop_left:crop_left + val_crop_w,
-                ]
-                gt = gt[
-                    :,
-                    :,
-                    crop_top * 2:(crop_top + val_crop_h) * 2,
-                    crop_left * 2:(crop_left + val_crop_w) * 2,
-                ]
+            # b, f, c, h, w = burst_noise.shape
+            # if h >= val_crop_h and w >= val_crop_w:
+            #     crop_top = (h - val_crop_h) // 2
+            #     crop_left = (w - val_crop_w) // 2
+            #     burst_noise = burst_noise[
+            #         :,
+            #         :,
+            #         :,
+            #         crop_top:crop_top + val_crop_h,
+            #         crop_left:crop_left + val_crop_w,
+            #     ]
+            #     gt = gt[
+            #         :,
+            #         :,
+            #         crop_top * 2:(crop_top + val_crop_h) * 2,
+            #         crop_left * 2:(crop_left + val_crop_w) * 2,
+            #     ]
 
             # burst_noise: (B, 9, 4, H, W) -> (B, 36, H, W)
             b, f, c, h, w = burst_noise.shape

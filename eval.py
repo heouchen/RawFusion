@@ -468,7 +468,7 @@ if __name__ == '__main__':
     parser.add_argument('--sliding_window', action='store_true',
                         help='Run inference on overlapping patches and blend them')
     parser.add_argument('--patch_size', type=int, nargs=2, metavar=('H', 'W'),
-                        default=(256, 256),
+                        default=(512, 512),
                         help='Sliding window patch size as H W (default: 192 384)')
     parser.add_argument('--stride', type=int, nargs=2, metavar=('H', 'W'),
                         default=None,

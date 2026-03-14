@@ -62,9 +62,9 @@ TRAIN_ROOT="${TRAIN_ROOT:-/home/chen/data/ntire2026/hdr/train/}"
 VAL_ROOT="${VAL_ROOT:-/home/chen/data/ntire2026/hdr/validation/}"
 
 # Training Hyperparameters (所有实验保持一致)
-EPOCHS="${EPOCHS:-300}"
+EPOCHS="${EPOCHS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
-LR="${LR:-1e-4}"
+LR="${LR:-5e-5}"
 LR_DECAY="${LR_DECAY:-0.95}"
 CUDA="${CUDA:-1}"
 MGPU="${MGPU:-0}"
@@ -76,7 +76,7 @@ COMPILE="${COMPILE:-0}"
 
 # 固定增广策略（crop + geo）
 # Baseline: 随机多尺度 crop
-CROP_SIZES="512x512"
+CROP_SIZES="96x192,192x384,384x768"
 PROGRESSIVE_CROP_ENABLE="${PROGRESSIVE_CROP_ENABLE:-0}"
 PROGRESSIVE_CROP_SCHEDULE="${PROGRESSIVE_CROP_SCHEDULE:-96x192@0.3,192x384@0.7,384x768@1.0}"
 PROGRESSIVE_BATCH_ENABLE="${PROGRESSIVE_BATCH_ENABLE:-0}"
