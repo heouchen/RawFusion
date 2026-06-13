@@ -244,6 +244,20 @@ class L1MuLawL1Loss(nn.Module):
         return self.w_linear * l1_linear + self.w_mulaw * l1_mulaw
 
 
+class AlignmentConsistencyLoss(nn.Module):
+    """Masked L1 consistency loss for warped alignment features."""
+    def forward(self, warped, reference, mask=None):
+        diff = torch.abs(warped - reference)
+        if mask is None:
+            return diff.mean()
+
+        if mask.shape[1] == 1 and diff.shape[1] != 1:
+            mask = mask.expand_as(diff)
+        weighted = diff * mask
+        denom = mask.sum().clamp_min(1e-6)
+        return weighted.sum() / denom
+
+
 # ======================== Loss Registry ========================
 
 LOSS_NAMES = [

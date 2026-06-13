@@ -68,6 +68,7 @@ def train(
     consist_enable=False,
     consist_sizes=None,
     consist_weight=0.1,
+    val_num_workers=0,
 ):
     torch.set_num_threads(num_threads)
     if val_every <= 0:
@@ -169,10 +170,10 @@ def train(
         dataset=val_set,
         batch_size=1,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=val_num_workers,
         pin_memory=cuda,
     )
-    if num_workers > 0:
+    if val_num_workers > 0:
         val_loader_kwargs['persistent_workers'] = True
     val_loader = torch.utils.data.DataLoader(**val_loader_kwargs)
     print("Val loader length:", len(val_loader))
@@ -238,6 +239,7 @@ def train(
     print(f"=> Train batch: {batch_desc}")
     print(
         f"=> Runtime: num_workers={num_workers}, val_every={val_every}, "
+        f"val_num_workers={val_num_workers}, "
         f"cudnn_benchmark={bool(cuda and cudnn_benchmark)}, compile={bool(compile_model)}, "
         f"mgpu={mGPU}"
     )
@@ -380,6 +382,8 @@ if __name__ == '__main__':
     parser.add_argument('--consist_enable', type=int, default=0, help='Enable multi-scale consistency constraint')
     parser.add_argument('--consist_sizes', type=str, default="96x192,192x384", help='Crop sizes for consistency constraint')
     parser.add_argument('--consist_weight', type=float, default=0.1, help='Weight for consistency loss')
+    parser.add_argument('--val_num_workers', type=int, default=0,
+                        help='Validation dataloader workers; default 0 to avoid extra worker residency')
 
     args = parser.parse_args()
 
@@ -419,4 +423,5 @@ if __name__ == '__main__':
         consist_enable=bool(args.consist_enable),
         consist_sizes=parse_crop_sizes(args.consist_sizes),
         consist_weight=args.consist_weight,
+        val_num_workers=args.val_num_workers,
     )

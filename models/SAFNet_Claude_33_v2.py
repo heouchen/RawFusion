@@ -64,6 +64,55 @@ class DeformConvRelu(nn.Module):
         offset = self.conv_offset(x)
         return self.prelu(self.deform(x, offset))
 
+# ======================== TLC Local Pool ========================
+class LocalAvgPool2d(nn.Module):
+    """TLC pool: keep GAP on train-sized inputs, use same-size local mean on larger inputs."""
+    def __init__(self, pad_mode='replicate'):
+        super().__init__()
+        self.pad_mode = pad_mode
+        self.tlc_enabled = False
+        self.base_input_size = None
+        self.runtime_input_size = None
+
+    def enable_tlc(self, base_input_size):
+        self.tlc_enabled = True
+        self.base_input_size = (int(base_input_size[0]), int(base_input_size[1]))
+
+    def disable_tlc(self):
+        self.tlc_enabled = False
+        self.runtime_input_size = None
+
+    def set_runtime_input_size(self, input_size):
+        if input_size is None:
+            self.runtime_input_size = None
+            return
+        self.runtime_input_size = (max(int(input_size[0]), 1), max(int(input_size[1]), 1))
+
+    def _compute_kernel(self, x):
+        feat_h, feat_w = x.shape[-2:]
+        in_h, in_w = self.runtime_input_size
+        base_h, base_w = self.base_input_size
+        kernel_h = max(1, int(round(feat_h * float(base_h) / float(in_h))))
+        kernel_w = max(1, int(round(feat_w * float(base_w) / float(in_w))))
+        return min(kernel_h, feat_h), min(kernel_w, feat_w)
+
+    def forward(self, x):
+        if (not self.tlc_enabled or
+                self.base_input_size is None or
+                self.runtime_input_size is None):
+            return F.adaptive_avg_pool2d(x, 1)
+
+        kernel_h, kernel_w = self._compute_kernel(x)
+        if kernel_h >= x.shape[-2] and kernel_w >= x.shape[-1]:
+            return F.adaptive_avg_pool2d(x, 1)
+
+        pad_top = kernel_h // 2
+        pad_bottom = kernel_h - 1 - pad_top
+        pad_left = kernel_w // 2
+        pad_right = kernel_w - 1 - pad_left
+        x_pad = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom), mode=self.pad_mode)
+        return F.avg_pool2d(x_pad, kernel_size=(kernel_h, kernel_w), stride=1)
+
 # ======================== CondConv ========================
 class CondConv2d_1x1(nn.Module):
     def __init__(self, in_channels, out_channels, num_experts=12):
@@ -71,24 +120,50 @@ class CondConv2d_1x1(nn.Module):
         self.num_experts = num_experts
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.local_aggregation = False
         self.weight = nn.Parameter(torch.Tensor(num_experts, out_channels, in_channels))
         self.bias = nn.Parameter(torch.Tensor(num_experts, out_channels))
+        self.routing_pool = LocalAvgPool2d()
         self.routing = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
+            self.routing_pool,
             nn.Conv2d(in_channels, num_experts, 1),
             nn.Softmax(dim=1)
         )
         nn.init.kaiming_normal_(self.weight, mode='fan_out', nonlinearity='relu')
         nn.init.zeros_(self.bias)
 
-    def forward(self, x):
+    def enable_tlc(self, train_input_size):
+        self.local_aggregation = True
+        self.routing_pool.enable_tlc(train_input_size)
+
+    def disable_tlc(self):
+        self.local_aggregation = False
+        self.routing_pool.disable_tlc()
+
+    def _forward_global(self, x, routing_weights):
         B, C, H, W = x.shape
-        rw = self.routing(x).view(B, self.num_experts)
+        rw = routing_weights.view(B, self.num_experts)
         w = torch.matmul(rw, self.weight.view(self.num_experts, -1))
         w = w.view(B, self.out_channels, self.in_channels)
         b = torch.matmul(rw, self.bias)
         x = torch.bmm(w, x.view(B, C, H * W)) + b.view(B, self.out_channels, 1)
         return x.view(B, self.out_channels, H, W)
+
+    def _forward_local(self, x, routing_weights):
+        out = None
+        for expert_idx in range(self.num_experts):
+            expert_weight = self.weight[expert_idx].unsqueeze(-1).unsqueeze(-1)
+            expert_out = F.conv2d(x, expert_weight, self.bias[expert_idx])
+            expert_out = expert_out * routing_weights[:, expert_idx:expert_idx + 1, :, :]
+            out = expert_out if out is None else out + expert_out
+        return out
+
+    def forward(self, x):
+        routing_weights = self.routing(x)
+        if (not self.local_aggregation or
+                (routing_weights.shape[-2] == 1 and routing_weights.shape[-1] == 1)):
+            return self._forward_global(x, routing_weights)
+        return self._forward_local(x, routing_weights)
 
 # ======================== Enhanced SRP DW Convolutions ========================
 class RepDWConvS(nn.Module):
@@ -258,7 +333,7 @@ class RepNeXtBlock(nn.Module):
         self.dw = ChunkConvV3(expand_ch, dilation=dilation)
         self.act = nn.GELU()
         self.se = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
+            LocalAvgPool2d(),
             nn.Conv2d(expand_ch, se_ch, 1, bias=True),
             nn.GELU(),
             nn.Conv2d(se_ch, expand_ch, 1, bias=True),
@@ -420,11 +495,36 @@ class SAFNet_Claude_33_v2(nn.Module):
         self.decoder = DecoderDCN()
         self.refinenet = RefineNet()
         self.learned_merge = LearnedMerge3Frame()
+        self.tlc_train_input_size = None
 
     def fuse_reparam(self):
         for m in self.modules():
             if isinstance(m, (RepDWConvS, RepDWConvM)):
                 m.fuse()
+
+    def enable_tlc(self, train_input_size):
+        self.tlc_train_input_size = (int(train_input_size[0]), int(train_input_size[1]))
+        for module in self.modules():
+            if isinstance(module, LocalAvgPool2d):
+                module.enable_tlc(self.tlc_train_input_size)
+            elif isinstance(module, CondConv2d_1x1):
+                module.enable_tlc(self.tlc_train_input_size)
+
+    def disable_tlc(self):
+        self.tlc_train_input_size = None
+        for module in self.modules():
+            if isinstance(module, LocalAvgPool2d):
+                module.disable_tlc()
+            elif isinstance(module, CondConv2d_1x1):
+                module.disable_tlc()
+
+    def set_tlc_runtime_input_size(self, input_size):
+        if self.tlc_train_input_size is None:
+            return
+        runtime_size = (int(input_size[0]), int(input_size[1]))
+        for module in self.modules():
+            if isinstance(module, LocalAvgPool2d):
+                module.set_runtime_input_size(runtime_size)
 
     def forward_flow_mask(self, img0_c, img4_c, img8_c, scale_factor=0.5):
         h, w = img0_c.shape[-2:]

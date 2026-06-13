@@ -213,6 +213,7 @@ class CustomDataset(torch.utils.data.Dataset):
                     raise FileNotFoundError(f"Cannot read: {gt_path}")
 
                 inputs = torch.stack(input_tensors, dim=0)
+
                 target = to_float_tensor(gt_arr)
                 self.cache.append((inputs, target))
 

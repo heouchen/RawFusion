@@ -50,6 +50,10 @@ while [[ $# -gt 0 ]]; do
       export COMPILE="$2"
       shift 2
       ;;
+    --val_num_workers)
+      export VAL_NUM_WORKERS="$2"
+      shift 2
+      ;;
     *)
       # Ignore other arguments
       shift
@@ -62,9 +66,9 @@ TRAIN_ROOT="${TRAIN_ROOT:-/home/chen/data/ntire2026/hdr/train/}"
 VAL_ROOT="${VAL_ROOT:-/home/chen/data/ntire2026/hdr/validation/}"
 
 # Training Hyperparameters (所有实验保持一致)
-EPOCHS="${EPOCHS:-100}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
-LR="${LR:-5e-5}"
+EPOCHS="${EPOCHS:-1000}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+LR="${LR:-2e-4}"
 LR_DECAY="${LR_DECAY:-0.95}"
 CUDA="${CUDA:-1}"
 MGPU="${MGPU:-0}"
@@ -73,10 +77,11 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 VAL_EVERY="${VAL_EVERY:-1}"
 CUDNN_BENCHMARK="${CUDNN_BENCHMARK:-0}"
 COMPILE="${COMPILE:-0}"
+VAL_NUM_WORKERS="${VAL_NUM_WORKERS:-0}"
 
 # 固定增广策略（crop + geo）
 # Baseline: 随机多尺度 crop
-CROP_SIZES="96x192,192x384,384x768"
+CROP_SIZES="128x128"
 PROGRESSIVE_CROP_ENABLE="${PROGRESSIVE_CROP_ENABLE:-0}"
 PROGRESSIVE_CROP_SCHEDULE="${PROGRESSIVE_CROP_SCHEDULE:-96x192@0.3,192x384@0.7,384x768@1.0}"
 PROGRESSIVE_BATCH_ENABLE="${PROGRESSIVE_BATCH_ENABLE:-0}"
@@ -99,6 +104,9 @@ run_one () {
 
   local model_name="$1"
   local exp_name="$2"
+  local epochs_local="${3:-${EPOCHS}}"
+  local pretrained_local="${4:-${pretrained}}"
+  local restart_local="${5:-${RESTART_TRAIN}}"
   local ts
   ts="$(date +%Y%m%d_%H%M%S)"
 
@@ -107,7 +115,10 @@ run_one () {
   echo "Model: ${model_name} | Loss: ${LOSS}"
   echo "Crop mode: $([[ \"${PROGRESSIVE_CROP_ENABLE}\" == \"1\" ]] && echo progressive || echo random)"
   echo "Batch mode: $([[ \"${PROGRESSIVE_BATCH_ENABLE}\" == \"1\" ]] && echo dynamic || echo fixed)"
-  echo "Runtime: workers=${NUM_WORKERS} | val_every=${VAL_EVERY} | cudnn_benchmark=${CUDNN_BENCHMARK} | compile=${COMPILE} | mgpu=${MGPU}"
+  echo "Runtime: workers=${NUM_WORKERS} | val_workers=${VAL_NUM_WORKERS} | val_every=${VAL_EVERY} | cudnn_benchmark=${CUDNN_BENCHMARK} | compile=${COMPILE} | mgpu=${MGPU}"
+  if [[ -n "${pretrained_local}" ]]; then
+    echo "Pretrained: ${pretrained_local}"
+  fi
   echo "------------------------------------------------------------"
 
   python train.py \
@@ -115,7 +126,7 @@ run_one () {
     --exp_name "${exp_name}" \
     --train_root "${TRAIN_ROOT}" \
     --val_root "${VAL_ROOT}" \
-    --epochs "${EPOCHS}" \
+    --epochs "${epochs_local}" \
     --batch_size "${BATCH_SIZE}" \
     --lr "${LR}" \
     --lr_decay "${LR_DECAY}" \
@@ -125,7 +136,8 @@ run_one () {
     --val_every "${VAL_EVERY}" \
     --cudnn_benchmark "${CUDNN_BENCHMARK}" \
     --compile "${COMPILE}" \
-    --restart_train "${RESTART_TRAIN}" \
+    --val_num_workers "${VAL_NUM_WORKERS}" \
+    --restart_train "${restart_local}" \
     --loss "${LOSS}" \
     --aug_enable 1 \
     --aug_crop_enable 1 \
@@ -138,7 +150,7 @@ run_one () {
     --aug_geo_flip_enable 1 \
     --aug_geo_rot90_enable 1 \
     --ema "${EMA_ENABLE}" \
-    --pretrained "${pretrained}" \
+    --pretrained "${pretrained_local}" \
     --consist_enable "${CONSIST_ENABLE}" \
     --consist_sizes "${CONSIST_SIZES}" \
     --consist_weight "${CONSIST_WEIGHT}"
@@ -156,8 +168,13 @@ run_one () {
 # run_one "safnet_claude_31" "model_submit_claude31"
 # run_one "safnet_claude_32" "model_submit_claude32"
 # run_one "safnet_claude_33" "model_submit_claude33"
-pretrained="/home/chen/work/RawFusion/checkpoint_dir/checkpoint_dir_safnet_claude_33_v2_model_submit_claude33_v2/model_best.pth.tar"
-run_one "safnet_claude_33_v2" "model_submit_claude33_v2"
+# pretrained="/home/chen/work/RawFusion/checkpoint_dir/checkpoint_dir_safnet_claude_33_v2_model_submit_claude33_v2/model_best.pth.tar"
+# run_one "safnet_claude_33_v2" "model_submit_claude33_v2"
+# pretrained="/home/chen/work/RawFusion/checkpoint_dir/checkpoint_dir_safnet_claude_33_v3_model_submit_claude33_v3/model_best.pth.tar"
+# run_one "safnet_claude_33_v3" "model_submit_claude33_v3"
+
+run_one "rawnet" "model_submit_rawnet"
+
 # run_one "safnet_claude_34" "model_submit_claude34"
 # run_one "safnet_claude_35" "model_submit_claude35"
 # run_one "safnet_claude_35_v2" "model_submit_claude35_v2"

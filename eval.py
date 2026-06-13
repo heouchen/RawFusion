@@ -8,12 +8,14 @@ Features:
   - Reports per-scene and average PSNR / SSIM
   - Creates img/ folder under the checkpoint dir for output images
   - Optional TTA (Test-Time Augmentation): 8-fold D4 geometric ensemble
+  - Optional TLC full-image inference for small-crop-trained models
 
 Usage:
   python eval.py --model safnet_claude_5 --exp_name model_cmp_claude5
   python eval.py --model safnet_claude_6 --exp_name model_cmp_claude6 --save_gt
   python eval.py --model safnet_claude_5 --exp_name model_cmp_claude5 --tta
   python eval.py --model safnet_claude_5 --exp_name model_cmp_claude5 --sliding_window
+  python eval.py --model safnet_claude_33_v3 --exp_name your_exp --tlc --tlc_train_size 128 128
 """
 
 import torch
@@ -35,6 +37,21 @@ from utils.utils import calculate_psnr, calculate_ssim
 from utils.checkpoint import load_checkpoint, load_model_state_dict
 
 
+def unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def set_tlc_runtime_input_size(model, input_size):
+    base_model = unwrap_model(model)
+    if hasattr(base_model, 'set_tlc_runtime_input_size'):
+        base_model.set_tlc_runtime_input_size(input_size)
+
+
+def run_model_once(model, x):
+    set_tlc_runtime_input_size(model, x.shape[-2:])
+    return model(x)
+
+
 def tta_forward(model, x):
     """8-fold TTA using D4 dihedral group (4 rotations x 2 flips).
 
@@ -53,7 +70,7 @@ def tta_forward(model, x):
             if rot_k:
                 x_aug = torch.rot90(x_aug, k=rot_k, dims=[-2, -1])
 
-            pred = model(x_aug)
+            pred = run_model_once(model, x_aug)
 
             # Inverse: undo rotation first, then undo flip
             if rot_k:
@@ -68,7 +85,7 @@ def tta_forward(model, x):
 
 def model_forward(model, x, tta=False):
     """Run a single inference pass, optionally with D4 TTA."""
-    return tta_forward(model, x) if tta else model(x)
+    return tta_forward(model, x) if tta else run_model_once(model, x)
 
 
 def compute_sliding_starts(length, patch_size, stride):
@@ -211,6 +228,8 @@ def eval_model(
     sliding_window=False,
     patch_size=(192, 384),
     stride=None,
+    tlc=False,
+    tlc_train_size=None,
 ):
     """Evaluate a model on the validation set and save output TIF images.
 
@@ -227,12 +246,19 @@ def eval_model(
     """
     if stride is None:
         stride = (patch_size[0] // 2, patch_size[1] // 2)
+    if tlc and sliding_window:
+        raise ValueError('TLC full-image inference cannot be combined with sliding_window.')
+    if tlc and tlc_train_size is None:
+        raise ValueError('Please provide --tlc_train_size H W when enabling TLC.')
 
     print(f'=== Evaluation: {model_name} (exp: {exp_name}) ===')
     if rep:
         print(f'    Rep: enabled (using reparameterized model)')
     if tta:
         print(f'    TTA: enabled (8-fold D4 geometric ensemble)')
+    if tlc:
+        print(f'    TLC: enabled')
+        print(f'    TLC train size: {tlc_train_size[0]}x{tlc_train_size[1]}')
     if sliding_window:
         print(f'    Sliding window: enabled')
         print(f'    Patch size: {patch_size[0]}x{patch_size[1]}')
@@ -292,6 +318,13 @@ def eval_model(
     # ---- Load weights ----
     checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     load_model_state_dict(model, checkpoint['state_dict'])
+    if tlc:
+        if not hasattr(model, 'enable_tlc'):
+            raise ValueError(
+                f'Model {model_name} does not expose enable_tlc(), '
+                f'cannot run full-image TLC inference.'
+            )
+        model.enable_tlc(tlc_train_size)
 
     if cuda:
         model = model.cuda()
@@ -450,7 +483,7 @@ if __name__ == '__main__':
     parser.add_argument('--exp_name', type=str, default='default',
                         help='Experiment name (must match training exp_name)')
     parser.add_argument('--val_root', type=str,
-                        default='/home/chen/data/ntire2026/hdr/validation/',
+                        default='/home/chen/data/ntire2026/hdr/test/',
                         help='Path to validation data')
     parser.add_argument('--checkpoint_dir', type=str,
                         default='./checkpoint_dir',
@@ -468,11 +501,16 @@ if __name__ == '__main__':
     parser.add_argument('--sliding_window', action='store_true',
                         help='Run inference on overlapping patches and blend them')
     parser.add_argument('--patch_size', type=int, nargs=2, metavar=('H', 'W'),
-                        default=(512, 512),
-                        help='Sliding window patch size as H W (default: 192 384)')
+                        default=(128, 128),
+                        help='Sliding window patch size as H W (default: 128 128)')
     parser.add_argument('--stride', type=int, nargs=2, metavar=('H', 'W'),
                         default=None,
                         help='Sliding window stride as H W (default: patch_size/2)')
+    parser.add_argument('--tlc', action='store_true',
+                        help='Enable TLC full-image inference with local pooling and local aggregation')
+    parser.add_argument('--tlc_train_size', type=int, nargs=2, metavar=('H', 'W'),
+                        default=None,
+                        help='Training crop size used by TLC, e.g. 128 128')
     args = parser.parse_args()
 
     eval_model(
@@ -489,4 +527,6 @@ if __name__ == '__main__':
         sliding_window=args.sliding_window,
         patch_size=tuple(args.patch_size),
         stride=tuple(args.stride) if args.stride is not None else None,
+        tlc=args.tlc,
+        tlc_train_size=tuple(args.tlc_train_size) if args.tlc_train_size is not None else None,
     )
