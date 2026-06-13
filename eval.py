@@ -11,11 +11,10 @@ Features:
   - Optional TLC full-image inference for small-crop-trained models
 
 Usage:
-  python eval.py --model safnet_claude_5 --exp_name model_cmp_claude5
-  python eval.py --model safnet_claude_6 --exp_name model_cmp_claude6 --save_gt
-  python eval.py --model safnet_claude_5 --exp_name model_cmp_claude5 --tta
-  python eval.py --model safnet_claude_5 --exp_name model_cmp_claude5 --sliding_window
-  python eval.py --model safnet_claude_33_v3 --exp_name your_exp --tlc --tlc_train_size 128 128
+  python eval.py --model safnet_claude_33_v3 --exp_name model_submit_claude33_v3
+  python eval.py --model safnet_claude_33_v3 --exp_name model_submit_claude33_v3 --tta
+  python eval.py --model safnet_claude_33_v3 --exp_name model_submit_claude33_v3 --sliding_window
+  python eval.py --model safnet_claude_33_v3 --exp_name model_submit_claude33_v3 --tlc --tlc_train_size 128 128
 """
 
 import torch

@@ -330,7 +330,7 @@ def train(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='ulite', choices=MODEL_NAMES)
+    parser.add_argument('--model', type=str, default='safnet_claude_33_v3', choices=MODEL_NAMES)
     parser.add_argument('--exp_name', type=str, default='default')
     parser.add_argument('--train_root', type=str, default="/home/chen/data/ntire2026/hdr/train/")
     parser.add_argument('--val_root', type=str, default="/home/chen/data/ntire2026/hdr/validation/")
