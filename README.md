@@ -1,115 +1,126 @@
-# Efficient Burst HDR and Restoration
+# RawFusion
 
-## Overview
-This is a competition held in CVPR 2026 New Trends in Image Restoration and Enhancement (NTIRE) workshop. The goal of
-this competition is to develop an efficient algorithm for burst HDR and restoration. 
+RawFusion is a PyTorch workspace for the NTIRE Efficient Burst HDR and Restoration task. It trains and evaluates lightweight RAW burst fusion models that reconstruct one HDR RGB image from nine degraded RAW input frames.
 
-More precisely, this competition involves the following tasks:
-* **Multi-frame RAW image fusion** : The inputs are given as multi-frame RAW images that follow Bayer patterns (GRBG).
-* **HDR image synthesis** : The given nine frames have different brightness levels. The goal is to fuse these frames into a High Dynamic Range (HDR) image. 
-* **Restoration** : The goal is to restore GT image from degraded RAW images, such as noise, translation, motion blur, and so on.
- 
-Overall, it is challenging to study an efficient algorithm for both multi-frame fusion and restoration.
-The ultimate goal of this work is to develop an on-device model that can be deployed on mobile devices, so there are time and memory constraints.
-For more details, see [https://codalab.lisn.upsaclay.fr/competitions/21316#learn_the_details-overview](https://www.codabench.org/competitions/12922/).
+## Repository Layout
 
-
-
-## Dataset
-The training, validation, and test datasets are constructed using the same method. 
-Training and validation datasets can be downloaded via an external link in the competition homepage. 
-Test dataset will be provided later. All images have the same size, 768(H) x 1536(W). 
-
-The specific configuration of datasets is as follows: 
-* **Training** : Consists of 300 scenes, where each scene contains 9 RAW input frames and one GT RGB image. 
-* **Validation** : Consists of 20 scenes, and GT images are hidden from participants, but PSNR and SSIM results are evaluated and will be announced on the leaderboard. 
-* **Test** : Consists of 20 scenes, and both GT images and evaluation results are hidden from participants during the competition. The final ranking will be based only on the
-  PSNR performance of the test set.
-
-The downloaded training dataset contains 200 scenes, where each scene consists of nine input RAW frames ("Scene-xxx-in-0.tif" through "Scene-xxx-in-8.tif") and one ground
-truth image ("Scene-xxx-gt.tif"). All training files (including GT images) are recommended to be stored in one folder, in the same level as the starting kit.
-For example, the structure of the directory should look like this: 
-```
-# directory hierarchy
-{root}/{dataset}/{trn}/{Scene-xxx-in-0.tif}
-{root}/{dataset}/{trn}/{Scene-xxx-gt.tif}
-{root}/{starting kit}/{README.md}
+```text
+DataLoader/          dataset loading, augmentation, and progressive crop collate logic
+models/              model registry and model implementations
+utils/               checkpoint, metric, EMA, and loss helpers
+scripts/             training and submission convenience scripts
+scoring_program/     challenge-style PSNR/SSIM scorer
+train.py             main training entry point
+eval.py              validation/test inference and result.zip packaging
+reparam_model.py     structural re-parameterization helper for supported models
+test_demo.py         lightweight dataset inspection utility
 ```
 
-The provided nine input frames have three brightness levels (low, middle, and high), which induces three different level of noises. 
-They further have the following characteristics: (We use the naming "Scene-xxx-in-0.tif" for convenience.)
-1. **Scene-xxx-in-0.tif** : This is the *reference frame*, aligned with GT image. Other all frames may not be aligned with the GT image. 
-This frame  is taken by a short exposure time, thus it has a high level noise.  
-2. **Scene-xxx-in-1.tif** and **Scene-xxx-in-2.tif** : These two frames have the same exposure time with the reference frame.
-3. **Scene-xxx-in-3.tif** to **Scene-xxx-in-5.tif** : These three frames have the middle exposure time, thus brighter than the reference frame, which means the level of noise is slightly decreased. 
-4. **Scene-xxx-in-6.tif** to **Scene-xxx-in-8.tif** : These three frames are made through high exposure time which have the lowest noise level.
+Generated files such as checkpoints, logs, output previews, datasets, and submission images are intentionally ignored by Git.
 
-<p align="center">
-<img src="./DB.png" width="1000px" height="562px" title="DB_example"/>
-(Although the image appears saturated for visualization purposes, the actual data values are not clipped and maintain accurate values.)
+## Environment
 
-Therefore, the key point of this competition is struggling *"how to effectively utilize the information of input frames while
-considering the characteristics of each frame."* 
+The code is developed with Python 3 and PyTorch. Install the runtime dependencies with:
 
-## Baseline model
-The baseline model is given by a very simple concatenated U-net. 
-The shape of input of the network follows `(batch x 9 x 768 x 1536)`, and the output shape follows `(batch x 
-3 x 768 x 1536)`.
-The basic loss implemented in this starting kit is MSE loss. The trained model is provided in `checkpoint_dir` folder. 
-Its performance is as follows:
-> **\# of model parameters** : 7.701(M)  
-**Total FLOPs of the model** : 0.666(T)   
-**PSNR** : 31.0134dB  
-**SSIM** : 0.9581   
+```bash
+pip install -r requirements.txt
+```
 
-## Requirements
-> python==3.8.10      
-> numpy==1.21.1    
-> opencv-python==4.7.0      
-> cuda==11.7    
-torch==1.13.1    
-torchvision==0.14.1   
+CUDA is recommended for training and full-frame evaluation.
 
+## Data Layout
 
+Each scene is expected to be stored as flat TIFF files:
 
-## Submissions - Validation Phase
-During the validation and test phases, the input images are opened to participants. Then, participants can submit their output images on the server. 
-For validation dataset, the submission system will evaluate the performance of the submitted images and provide the average PSNR, SSIM scores.
-Submission for each participant (team) is limited up to 30 times per day. 
+```text
+Scene-000-in-0.tif
+Scene-000-in-1.tif
+...
+Scene-000-in-8.tif
+Scene-000-gt.tif
+```
 
-## Submissions - Test Phase
-From 14th March, the test phase begins and the test input images are opened to participants. In the same way as validation phase, 
-participants can submit their output images on the server. Submission during the test phase is limited up to 3 times.
- 
-## Other competition rules
-All training datasets and their images must not be shared with others or used for other purposes.
-Regarding training processes and techniques, anything is possible as long as it does not violate 
-the time and memory constraints we set in this challenge 
-(e.g. using other public data for pre-training, importing pre-trained networks, using generative models, etc.).
-In addition, it is not necessary to use all the input frames - to save memory and FLOPs, only a few frames may be selected and utilized. 
+Input RAW files are single-channel Bayer images with GRBG layout. The loader packs each RAW frame to four channels and maps one scene to a tensor shaped `(9, 4, H/2, W/2)`. GT files are read as 3-channel float RGB/BGR tensors in `[0, 1]`.
 
-## Contacts
-For any questions regarding this competition, please ask through forum of our competition site or contact to the organizers via email. 
+Default local paths used by scripts:
 
+```text
+/home/chen/data/ntire2026/hdr/train/
+/home/chen/data/ntire2026/hdr/validation/
+/home/chen/data/ntire2026/hdr/test/
+```
 
+Override these paths with `--train_root`, `--val_root`, or the corresponding environment variables in `scripts/run.sh`.
 
+## Training
 
+Use `train.py` directly for controlled experiments:
 
+```bash
+python train.py \
+  --model safnet_claude_33_v3 \
+  --exp_name model_submit_claude33_v3 \
+  --train_root /home/chen/data/ntire2026/hdr/train/ \
+  --val_root /home/chen/data/ntire2026/hdr/validation/ \
+  --epochs 1000 \
+  --batch_size 4 \
+  --lr 2e-4 \
+  --loss mse \
+  --aug_enable 1 \
+  --aug_crop_enable 1 \
+  --aug_crop_sizes 128x128 \
+  --aug_geo_enable 1
+```
 
+The convenience wrapper `scripts/run.sh` contains the current experiment defaults and can be launched with:
 
+```bash
+bash scripts/run.sh --gpu 0 --num_workers 4 --val_every 1
+```
 
+Checkpoints are written under `checkpoint_dir/checkpoint_dir_<model>_<exp_name>/`. Training logs are written under `output_log/`.
 
+## Evaluation and Submission
 
+Run validation or test inference with `eval.py`:
 
+```bash
+python eval.py \
+  --model safnet_claude_33_v3 \
+  --exp_name model_submit_claude33_v3 \
+  --val_root /home/chen/data/ntire2026/hdr/validation/
+```
 
+For final submission-style inference with re-parameterization, TTA, and TLC:
 
+```bash
+bash scripts/test.sh safnet_claude_33_v3 model_submit_claude33_v3 128 128
+```
 
+Outputs are saved to the experiment checkpoint directory:
 
+```text
+checkpoint_dir/checkpoint_dir_<model>_<exp_name>/img/
+checkpoint_dir/checkpoint_dir_<model>_<exp_name>/result.zip
+```
 
+## Model Registry
 
+Models are registered in `models/__init__.py` and can be selected with `--model`. Current notable entries include:
 
+```text
+safnet_claude_33
+safnet_claude_33_v2
+safnet_claude_33_v3
+safnet_claude_33_v4
+rawnet
+unet
+```
 
+When adding a new model, implement it under `models/`, import it in `models/__init__.py`, and add it to `_MODEL_MAP`.
 
+## Notes
 
-
-
+- `output_log/`, `checkpoint_dir/`, `output/`, datasets, and generated TIFF/ZIP files are local artifacts and are ignored by Git.
+- Do not commit private keys, pretrained checkpoints, datasets, or generated submissions.
+- If a private key has ever been pushed to a remote repository, remove it from active use and rotate it even after deleting it from the current tree.

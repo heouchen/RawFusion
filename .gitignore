@@ -1,5 +1,41 @@
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Local environments and editor state
+.venv/
+venv/
+.env
+.env.*
+.DS_Store
+.claude/
+.vscode/
+.idea/
+
+# Credentials and local keys
+id_*
+*.pem
+*.key
+*.pub
+\\
+
+# Training and inference artifacts
 checkpoint_dir/
 output/
+output_log/
 logs_dir/
+test_img_results/
+model_zoo/
+*.pth
+*.pth.tar
+*.pt
+*.ckpt
+result.zip
+
+# Local datasets and generated submissions
+trainset/
+valset/
+testset/
+datasets/
+*.tif
+*.tiff

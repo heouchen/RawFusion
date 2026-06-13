@@ -1,2 +1,0 @@
-epoch	loss	psnr	ssim	time_s	lr	crop_mode	crop_size	batch_size
-0	0.000180	39.841582	0.957301	164.71	0.00000100	random	448x896	1
